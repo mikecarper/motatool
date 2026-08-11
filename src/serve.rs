@@ -7,9 +7,8 @@
 use crate::format::{rd_u32, seeder, Manifest, HEADER_LEN, MAGIC, MFL};
 use crate::verify::verify;
 use anyhow::{Context, Result};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -201,7 +200,7 @@ impl SeederCore {
     fn publish(&self, part: &Path, done: &Path) -> std::io::Result<()> {
         let size = std::fs::metadata(part)?.len();
         let mut head = [0u8; 8];
-        std::fs::File::open(part)?.read_exact_at(&mut head, 0)?;
+        std::fs::File::open(part)?.read_exact(&mut head)?;
         if head[..4] != MAGIC || rd_u32(&head, 4) as u64 != size {
             return Err(std::io::Error::new(
                 ErrorKind::InvalidData,
@@ -237,15 +236,16 @@ fn store_path(store_dir: &Path, mid: &[u8; 4], part: bool) -> PathBuf {
 }
 
 fn write_at(path: &Path, off: u64, data: &[u8]) -> std::io::Result<()> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)?
-        .write_all_at(data, off)
+    let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
+    file.seek(SeekFrom::Start(off))?;
+    file.write_all(data)
 }
 
 fn read_at(path: &Path, off: u64, len: usize) -> std::io::Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
-    std::fs::File::open(path)?.read_exact_at(&mut buf, off)?;
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(off))?;
+    file.read_exact(&mut buf)?;
     Ok(buf)
 }
 
