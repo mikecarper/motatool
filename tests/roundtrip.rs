@@ -16,7 +16,7 @@ fn opts(fw: Vec<u8>) -> BuildOpts {
         fw,
         base: None,
         patch_type: PatchType::Sequential,
-        inplace_memory: 0,
+        inplace_memory: None,
         segment_size: 0,
         target_id: Some(0x04D4_13FD),
         fw_version: Some(0x0111_0000),

@@ -7,7 +7,9 @@
 
 use crate::crypto::{ed25519_public_from_seed, ed25519_sign, sha256};
 use crate::encode::PatchType;
-use crate::endf::{ensure_endf, has_endf, parse_ident, version_str};
+use crate::endf::{
+    ensure_endf, has_endf, parse_ident, parse_nrf52_layout, version_str, Nrf52Layout,
+};
 use crate::format::*;
 use crate::merkle;
 use anyhow::{bail, Result};
@@ -15,12 +17,12 @@ use anyhow::{bail, Result};
 pub struct BuildOpts {
     pub fw: Vec<u8>,
     pub base: Option<Vec<u8>>,
-    pub patch_type: PatchType,   // delta layout; used iff base.is_some()
-    pub inplace_memory: u32,     // in-place apply window; used iff patch_type == InPlace
-    pub segment_size: u32,       // in-place segment; used iff patch_type == InPlace
-    pub target_id: Option<u32>,  // overrides the EndF identity
-    pub fw_version: Option<u32>, // overrides the EndF identity
-    pub hw_id: Option<String>,   // overrides the EndF identity
+    pub patch_type: PatchType, // delta layout; used iff base.is_some()
+    pub inplace_memory: Option<u32>, // explicit window; None derives from embedded layout or legacy fallback
+    pub segment_size: u32,           // in-place segment; used iff patch_type == InPlace
+    pub target_id: Option<u32>,      // overrides the EndF identity
+    pub fw_version: Option<u32>,     // overrides the EndF identity
+    pub hw_id: Option<String>,       // overrides the EndF identity
     pub sign_seed: Option<[u8; 32]>,
     pub block_size: u32,
     pub force: bool,
@@ -139,25 +141,131 @@ fn build_delta(
             crate::encode::encode_sequential(&base_image, image),
         ),
         PatchType::InPlace => {
-            if o.segment_size == 0 || o.inplace_memory % o.segment_size != 0 {
-                bail!(
-                    "in-place: --inplace-memory ({}) must be a non-zero multiple of --segment-size ({})",
-                    o.inplace_memory,
-                    o.segment_size
-                );
-            }
-            (
-                Codec::DetoolsInplace,
-                crate::encode::encode_in_place(
-                    &base_image,
-                    image,
-                    o.inplace_memory,
-                    o.segment_size,
-                ),
-            )
+            let patch = match o.inplace_memory {
+                Some(memory) => {
+                    validate_inplace_memory(&base_image, image, memory, o.segment_size)?;
+                    crate::encode::encode_in_place(&base_image, image, memory, o.segment_size)
+                }
+                None => match parse_nrf52_layout(image) {
+                    Some(layout) => auto_inplace_patch(
+                        &base_image,
+                        image,
+                        layout,
+                        o.segment_size,
+                        o.block_size,
+                    )?,
+                    None => {
+                        let memory = NRF52_FALLBACK_INPLACE_MEMORY;
+                        validate_inplace_memory(&base_image, image, memory, o.segment_size)?;
+                        crate::encode::encode_in_place(&base_image, image, memory, o.segment_size)
+                    }
+                },
+            };
+            (Codec::DetoolsInplace, patch)
         }
     };
     Ok((codec, patch, base_hash))
+}
+
+fn validate_inplace_memory(from: &[u8], to: &[u8], memory: u32, segment: u32) -> Result<()> {
+    if segment == 0 || !segment.is_power_of_two() || memory == 0 || memory % segment != 0 {
+        bail!(
+            "in-place: --inplace-memory ({memory}) must be a non-zero multiple of power-of-two --segment-size ({segment})"
+        );
+    }
+    let minimum = (from.len() as u64)
+        .checked_add(2 * segment as u64)
+        .unwrap_or(u64::MAX)
+        .max(to.len() as u64);
+    if minimum > memory as u64 {
+        bail!(
+            "in-place: apply window {memory} B is too small for base {} B, target {} B, and two-segment shift",
+            from.len(),
+            to.len()
+        );
+    }
+    Ok(())
+}
+
+fn patch_container_total(patch_len: usize, block_size: u32) -> Result<u32> {
+    if block_size == 0 || !block_size.is_power_of_two() {
+        bail!("in-place: block size must be a non-zero power of two");
+    }
+    let blocks = patch_len.div_ceil(block_size as usize);
+    let total = HEADER_LEN
+        .checked_add(MFL)
+        .and_then(|n| n.checked_add(blocks.checked_mul(4)?))
+        .and_then(|n| n.checked_add(patch_len))
+        .and_then(|n| n.checked_add(TRAILER_LEN))
+        .ok_or_else(|| anyhow::anyhow!("in-place container size overflow"))?;
+    u32::try_from(total).map_err(|_| anyhow::anyhow!("in-place container exceeds 32-bit format"))
+}
+
+fn align_down(value: u32, unit: u32) -> u32 {
+    value & !(unit - 1)
+}
+
+/// Encode using the largest monotonically safe workspace below the package's eventual page-aligned
+/// staging address. Re-encoding can change patch size, so candidates only move downward until the
+/// actual container fits. SD-backed packages need no internal reservation and use the full app region.
+fn auto_inplace_patch(
+    from: &[u8],
+    to: &[u8],
+    layout: Nrf52Layout,
+    segment: u32,
+    block_size: u32,
+) -> Result<Vec<u8>> {
+    if segment == 0 || !segment.is_power_of_two() {
+        bail!("in-place: --segment-size must be a non-zero power of two");
+    }
+    if layout.stage_ceiling <= layout.app_base || layout.linked_app_end <= layout.app_base {
+        bail!("in-place: invalid embedded nRF52 layout");
+    }
+    let linked_span = layout.linked_app_end - layout.app_base;
+    if to.len() as u64 > linked_span as u64 {
+        bail!(
+            "in-place: target image {} B exceeds embedded application region {} B",
+            to.len(),
+            linked_span
+        );
+    }
+
+    if layout.sd_backed() {
+        let memory = align_down(layout.linked_app_end - layout.app_base, segment);
+        validate_inplace_memory(from, to, memory, segment)?;
+        return Ok(crate::encode::encode_in_place(from, to, memory, segment));
+    }
+
+    // Every non-empty internal package consumes at least the highest 4 KiB flash page below its ceiling.
+    let span = layout.stage_ceiling - layout.app_base;
+    if span <= NRF52_FLASH_PAGE {
+        bail!("in-place: nRF52 layout leaves no internal staging page");
+    }
+    let mut memory = align_down(span - NRF52_FLASH_PAGE, segment);
+    for _ in 0..16 {
+        validate_inplace_memory(from, to, memory, segment)?;
+        let patch = crate::encode::encode_in_place(from, to, memory, segment);
+        let total = patch_container_total(patch.len(), block_size)?;
+        if total >= layout.stage_ceiling - layout.app_base {
+            bail!(
+                "in-place: package does not fit below staging ceiling 0x{:X}",
+                layout.stage_ceiling
+            );
+        }
+        let stage_start = align_down(layout.stage_ceiling - total, NRF52_FLASH_PAGE);
+        if stage_start <= layout.app_base {
+            bail!("in-place: package leaves no apply workspace");
+        }
+        let allowed = align_down(stage_start - layout.app_base, segment);
+        if memory <= allowed {
+            return Ok(patch);
+        }
+        memory = allowed;
+    }
+    bail!(
+        "in-place workspace did not converge below ceiling 0x{:X}",
+        layout.stage_ceiling
+    )
 }
 
 /// log2 of a power-of-two block size (1024 → 10).

@@ -69,9 +69,10 @@ struct BuildArgs {
     /// Delta patch layout (with --base): `sequential` (ESP32 A/B) or `in-place` (nRF52 single-slot).
     #[arg(long = "patch-type", default_value = "sequential")]
     patch_type: CliPatchType,
-    /// In-place apply window in bytes; must match the device bootloader (nRF52 default 0x98000).
-    #[arg(long = "inplace-memory", default_value = "0x98000")]
-    inplace_memory: String,
+    /// In-place apply window override. By default it is derived from the firmware's embedded nRF52
+    /// layout record; older firmware without one uses the conservative 0x98000 window.
+    #[arg(long = "inplace-memory")]
+    inplace_memory: Option<String>,
     /// In-place segment size in bytes (default one nRF52 flash page).
     #[arg(long = "segment-size", default_value_t = 4096)]
     segment_size: u32,
@@ -199,7 +200,12 @@ fn cmd_build(a: BuildArgs) -> Result<()> {
         fw,
         base,
         patch_type: a.patch_type.into(),
-        inplace_memory: parse_u32_auto(&a.inplace_memory).context("--inplace-memory")?,
+        inplace_memory: a
+            .inplace_memory
+            .as_deref()
+            .map(parse_u32_auto)
+            .transpose()
+            .context("--inplace-memory")?,
         segment_size: a.segment_size,
         target_id,
         fw_version,

@@ -30,6 +30,66 @@ pub fn parse_ident(image: &[u8]) -> FwIdent {
     }
 }
 
+/// Resolved nRF52 flash geometry appended by MeshCore immediately before EndF.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Nrf52Layout {
+    pub app_base: u32,
+    pub linked_app_end: u32,
+    pub stage_ceiling: u32,
+    pub flags: u8,
+}
+
+impl Nrf52Layout {
+    pub fn sd_backed(self) -> bool {
+        self.flags & NRF52_LAYOUT_FLAG_SD != 0
+    }
+}
+
+/// Read a validated layout record. Firmware predating the record returns `None` and keeps the legacy
+/// 0x98000 packaging default; no target-name or board-name guessing is used.
+pub fn parse_nrf52_layout(image: &[u8]) -> Option<Nrf52Layout> {
+    if !has_endf(image) || image.len() < ENDF_LEN + NRF52_LAYOUT_LEN {
+        return None;
+    }
+    let r = &image[image.len() - ENDF_LEN - NRF52_LAYOUT_LEN..image.len() - ENDF_LEN];
+    if r[..8] != NRF52_LAYOUT_MAGIC
+        || r[8] != NRF52_LAYOUT_VERSION
+        || u16::from_le_bytes([r[10], r[11]]) as usize != NRF52_LAYOUT_LEN
+    {
+        return None;
+    }
+    let layout = Nrf52Layout {
+        flags: r[9],
+        app_base: rd_u32(r, 12),
+        linked_app_end: rd_u32(r, 16),
+        stage_ceiling: rd_u32(r, 20),
+    };
+    let known_flags = NRF52_LAYOUT_FLAG_SD | NRF52_LAYOUT_FLAG_INTERNAL_EXTRAFS;
+    if layout.flags & !known_flags != 0
+        || !matches!(
+            layout.app_base,
+            NRF52_APP_BASE_S140_V6 | NRF52_APP_BASE_S140_V7
+        )
+        || !matches!(layout.linked_app_end, NRF52_EXTRAFS_START | NRF52_APP_END)
+        || !matches!(layout.stage_ceiling, NRF52_EXTRAFS_START | NRF52_APP_END)
+        || layout.app_base >= layout.linked_app_end
+        || layout.linked_app_end > NRF52_APP_END
+    {
+        return None;
+    }
+    let expected_ceiling = if layout.sd_backed() {
+        NRF52_APP_END
+    } else if layout.flags & NRF52_LAYOUT_FLAG_INTERNAL_EXTRAFS != 0 {
+        NRF52_EXTRAFS_START
+    } else {
+        NRF52_APP_END
+    };
+    if layout.stage_ceiling != expected_ceiling {
+        return None;
+    }
+    Some(layout)
+}
+
 /// Append a 56-byte EndF trailer carrying `ident` if `image` has none (idempotent — a trailed image is
 /// returned unchanged). Returns the image and its 8-byte body hash.
 pub fn ensure_endf(image: &[u8], ident: &FwIdent) -> (Vec<u8>, [u8; 8]) {
@@ -119,5 +179,53 @@ mod tests {
         let back = parse_ident(&trailed);
         assert_eq!(back.target_id, id.target_id);
         assert_eq!(back.hw_id, "RAK4631");
+    }
+
+    #[test]
+    fn parses_embedded_nrf52_layout_and_old_firmware_falls_back() {
+        let mut body = vec![0xA5u8; 200];
+        body.extend_from_slice(&NRF52_LAYOUT_MAGIC);
+        body.push(NRF52_LAYOUT_VERSION);
+        body.push(0);
+        body.extend_from_slice(&(NRF52_LAYOUT_LEN as u16).to_le_bytes());
+        body.extend_from_slice(&NRF52_APP_BASE_S140_V7.to_le_bytes());
+        body.extend_from_slice(&NRF52_EXTRAFS_START.to_le_bytes());
+        body.extend_from_slice(&NRF52_APP_END.to_le_bytes());
+        let image = ensure_endf(&body, &FwIdent::default()).0;
+        assert_eq!(
+            parse_nrf52_layout(&image),
+            Some(Nrf52Layout {
+                app_base: NRF52_APP_BASE_S140_V7,
+                linked_app_end: NRF52_EXTRAFS_START,
+                stage_ceiling: NRF52_APP_END,
+                flags: 0,
+            })
+        );
+
+        let mut inconsistent = body.clone();
+        let ceiling = inconsistent.len() - 4;
+        inconsistent[ceiling..].copy_from_slice(&NRF52_EXTRAFS_START.to_le_bytes());
+        assert_eq!(
+            parse_nrf52_layout(&ensure_endf(&inconsistent, &FwIdent::default()).0),
+            None
+        );
+
+        let mut internal = body.clone();
+        let record = internal.len() - NRF52_LAYOUT_LEN;
+        internal[record + 9] = NRF52_LAYOUT_FLAG_INTERNAL_EXTRAFS;
+        internal[ceiling..].copy_from_slice(&NRF52_EXTRAFS_START.to_le_bytes());
+        assert_eq!(
+            parse_nrf52_layout(&ensure_endf(&internal, &FwIdent::default()).0),
+            Some(Nrf52Layout {
+                app_base: NRF52_APP_BASE_S140_V7,
+                linked_app_end: NRF52_EXTRAFS_START,
+                stage_ceiling: NRF52_EXTRAFS_START,
+                flags: NRF52_LAYOUT_FLAG_INTERNAL_EXTRAFS,
+            })
+        );
+        assert_eq!(
+            parse_nrf52_layout(&ensure_endf(b"old", &FwIdent::default()).0),
+            None
+        );
     }
 }

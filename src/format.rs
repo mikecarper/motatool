@@ -52,11 +52,20 @@ pub const ENDF_OFF_FWVER: usize = 16;
 pub const ENDF_OFF_TARGET: usize = 20;
 pub const ENDF_OFF_HWID: usize = 24;
 
-// ---- nRF52 in-place apply limits (mirror OtaFlashLayout_nrf52.h); used to warn on oversized deltas ----
-pub const NRF52_INPLACE_MEMORY: u32 = 0x0009_8000;
+// ---- nRF52 in-place layout (mirror OtaFlashLayout_nrf52.h / MeshCore's appended layout record) ----
+pub const NRF52_FALLBACK_INPLACE_MEMORY: u32 = 0x0009_8000;
+pub const NRF52_INPLACE_MEMORY: u32 = NRF52_FALLBACK_INPLACE_MEMORY; // compatibility name
 pub const NRF52_INPLACE_SEGMENT: u32 = 4096;
-pub const NRF52_FLASH_SPAN: u32 = 0x000D_4000 - 0x0002_6000; // 0xAE000
-pub const NRF52_MAX_INPLACE_MOTA: u32 = NRF52_FLASH_SPAN - NRF52_INPLACE_MEMORY; // ~90 KB
+pub const NRF52_APP_BASE_S140_V6: u32 = 0x0002_6000;
+pub const NRF52_APP_BASE_S140_V7: u32 = 0x0002_7000;
+pub const NRF52_EXTRAFS_START: u32 = 0x000D_4000;
+pub const NRF52_APP_END: u32 = 0x000E_D000;
+pub const NRF52_FLASH_PAGE: u32 = 4096;
+pub const NRF52_LAYOUT_MAGIC: [u8; 8] = *b"mOTALay1";
+pub const NRF52_LAYOUT_VERSION: u8 = 1;
+pub const NRF52_LAYOUT_LEN: usize = 24;
+pub const NRF52_LAYOUT_FLAG_SD: u8 = 0x01;
+pub const NRF52_LAYOUT_FLAG_INTERNAL_EXTRAFS: u8 = 0x02;
 
 /// The mota-seeder link protocol (host ⇄ node), mirroring `src/helpers/ota/MotaSeederProto.h`.
 ///

@@ -8,6 +8,11 @@
 mod common;
 
 use motatool::endf::ensure_endf;
+use motatool::format::{
+    NRF52_APP_BASE_S140_V6, NRF52_APP_BASE_S140_V7, NRF52_APP_END, NRF52_EXTRAFS_START,
+    NRF52_FALLBACK_INPLACE_MEMORY, NRF52_FLASH_PAGE, NRF52_LAYOUT_LEN, NRF52_LAYOUT_MAGIC,
+    NRF52_LAYOUT_VERSION,
+};
 use motatool::{build, verify, BuildOpts, Codec, FwIdent, Manifest, PatchType};
 
 const MEM: u32 = 0x8000; // in-place window for the tiny test images (> base+target)
@@ -39,7 +44,7 @@ fn opts(new_fw: Vec<u8>, base_fw: Vec<u8>, ptype: PatchType) -> BuildOpts {
         fw: new_fw,
         base: Some(base_fw),
         patch_type: ptype,
-        inplace_memory: MEM,
+        inplace_memory: Some(MEM),
         segment_size: SEG,
         target_id: Some(0x04D4_13FD),
         fw_version: Some(0x0111_0000),
@@ -48,6 +53,43 @@ fn opts(new_fw: Vec<u8>, base_fw: Vec<u8>, ptype: PatchType) -> BuildOpts {
         block_size: 1024,
         force: false,
     }
+}
+
+fn with_layout(mut body: Vec<u8>, app_base: u32, linked_end: u32, ceiling: u32) -> Vec<u8> {
+    body.extend_from_slice(&NRF52_LAYOUT_MAGIC);
+    body.push(NRF52_LAYOUT_VERSION);
+    body.push(0);
+    body.extend_from_slice(&(NRF52_LAYOUT_LEN as u16).to_le_bytes());
+    body.extend_from_slice(&app_base.to_le_bytes());
+    body.extend_from_slice(&linked_end.to_le_bytes());
+    body.extend_from_slice(&ceiling.to_le_bytes());
+    body
+}
+
+fn patch_memory(blob: &[u8]) -> u32 {
+    let m = Manifest::parse(blob).unwrap();
+    let payload = &blob[m.payload_off()..m.payload_off() + m.payload_size as usize];
+    assert_eq!((payload[0] >> 4) & 7, 1);
+    let mut pos = 1;
+    let first = payload[pos];
+    pos += 1;
+    assert_eq!(first & 0x40, 0);
+    let mut value = (first & 0x3f) as u32;
+    let mut shift = 6;
+    let mut byte = first;
+    while byte & 0x80 != 0 {
+        byte = payload[pos];
+        pos += 1;
+        value |= ((byte & 0x7f) as u32) << shift;
+        shift += 7;
+    }
+    value
+}
+
+fn assert_auto_patch_fits(blob: &[u8], app_base: u32, ceiling: u32) {
+    let stage_start = (ceiling - blob.len() as u32) & !(NRF52_FLASH_PAGE - 1);
+    assert!(stage_start > app_base);
+    assert!(patch_memory(blob) <= stage_start - app_base);
 }
 
 /// Core assertions shared by both patch types: the built `.mota` verifies, is a delta with the right
@@ -142,5 +184,56 @@ fn delta_suggested_name_tags_the_codec() {
         ip.suggested_name.contains("_ipdelta_"),
         "{}",
         ip.suggested_name
+    );
+}
+
+#[test]
+fn auto_memory_uses_embedded_layout_and_legacy_fallback() {
+    let (base_body, tgt_body) = base_and_target();
+    let (base_image, _) = ensure_endf(&base_body, &ident());
+
+    let mut legacy = opts(
+        with_layout(
+            tgt_body.clone(),
+            NRF52_APP_BASE_S140_V6,
+            NRF52_EXTRAFS_START,
+            NRF52_EXTRAFS_START,
+        ),
+        base_image.clone(),
+        PatchType::InPlace,
+    );
+    legacy.inplace_memory = None;
+    let legacy_built = build(&legacy).unwrap();
+    let legacy_memory = patch_memory(&legacy_built.bytes);
+    assert_auto_patch_fits(
+        &legacy_built.bytes,
+        NRF52_APP_BASE_S140_V6,
+        NRF52_EXTRAFS_START,
+    );
+
+    let mut expanded = opts(
+        with_layout(
+            tgt_body.clone(),
+            NRF52_APP_BASE_S140_V7,
+            NRF52_EXTRAFS_START,
+            NRF52_APP_END,
+        ),
+        base_image.clone(),
+        PatchType::InPlace,
+    );
+    expanded.inplace_memory = None;
+    let expanded_built = build(&expanded).unwrap();
+    let expanded_memory = patch_memory(&expanded_built.bytes);
+    assert_auto_patch_fits(&expanded_built.bytes, NRF52_APP_BASE_S140_V7, NRF52_APP_END);
+
+    assert!(legacy_memory < NRF52_EXTRAFS_START - NRF52_APP_BASE_S140_V6);
+    assert!(expanded_memory < NRF52_APP_END - NRF52_APP_BASE_S140_V7);
+    assert!(expanded_memory > legacy_memory);
+
+    let mut old = opts(tgt_body, base_image, PatchType::InPlace);
+    old.inplace_memory = None;
+    assert_eq!(
+        patch_memory(&build(&old).unwrap().bytes),
+        NRF52_FALLBACK_INPLACE_MEMORY
     );
 }

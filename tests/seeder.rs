@@ -11,7 +11,7 @@ fn a_mota() -> Vec<u8> {
         fw: (0..3000u32).map(|i| i as u8).collect(),
         base: None,
         patch_type: motatool::PatchType::Sequential,
-        inplace_memory: 0,
+        inplace_memory: None,
         segment_size: 0,
         target_id: Some(0x04D4_13FD),
         fw_version: Some(0x0111_0000),
