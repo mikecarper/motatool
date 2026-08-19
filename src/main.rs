@@ -148,6 +148,9 @@ struct ServeArgs {
     /// (serial only) don't auto-send `ota folder on`/`off` on the node's console.
     #[arg(long = "no-enable")]
     no_enable: bool,
+    /// (serial only) switch a Companion USB connection from binary framing to its text terminal.
+    #[arg(long = "companion-terminal", requires = "serial")]
+    companion_terminal: bool,
     /// Warm-start: stage this similar build's payload into each captured .part (for `ota pull … validate`).
     #[arg(long)]
     seed: Option<String>,
@@ -476,6 +479,15 @@ fn cmd_serve(a: ServeArgs) -> Result<()> {
     })
     .context("installing Ctrl-C handler")?;
 
+    // A Companion USB build starts in binary framing. Keep its terminal mode active for the whole
+    // serial session so the same link can carry console text and OTA seeder request frames.
+    let companion_terminal = !use_tcp && a.companion_terminal;
+    if companion_terminal {
+        link.write_all(b"+++MESHCORE-TERM-START\r")
+            .context("entering Companion USB terminal mode")?;
+        println!("sent Companion terminal start token");
+    }
+
     // The serial console shares the wire, so auto-toggle `ota folder on/off`; the TCP seeder port
     // auto-enables relaying on connect, so there's nothing to send.
     let enable = !use_tcp && !a.no_enable;
@@ -495,6 +507,9 @@ fn cmd_serve(a: ServeArgs) -> Result<()> {
 
     if enable {
         let _ = link.write_all(b"ota folder off\r\n");
+    }
+    if companion_terminal {
+        let _ = link.write_all(b"+++MESHCORE-TERM-STOP");
     }
     println!("\nbye");
     Ok(())

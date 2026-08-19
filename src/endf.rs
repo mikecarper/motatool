@@ -140,14 +140,20 @@ pub fn pack_version(s: &str) -> Result<u32> {
         | (parts[3] & 0xFF))
 }
 
-/// Render the packed version as `"major.minor.patch"` (the prerelease byte is not shown).
+/// Render the packed version, including a nonzero fourth byte.
 pub fn version_str(v: u32) -> String {
-    format!(
+    let core = format!(
         "{}.{}.{}",
         (v >> 24) & 0xFF,
         (v >> 16) & 0xFF,
         (v >> 8) & 0xFF
-    )
+    );
+    let fourth = v & 0xFF;
+    if fourth == 0 {
+        core
+    } else {
+        format!("{core}.{fourth}")
+    }
 }
 
 #[cfg(test)]
@@ -158,6 +164,8 @@ mod tests {
     fn version_roundtrip() {
         assert_eq!(pack_version("1.17.0").unwrap(), 0x0111_0000);
         assert_eq!(version_str(0x0111_0000), "1.17.0");
+        assert_eq!(pack_version("1.17.1.02").unwrap(), 0x0111_0102);
+        assert_eq!(version_str(0x0111_0102), "1.17.1.2");
         assert!(pack_version("1..2").is_err());
         assert!(pack_version("").is_err());
         assert!(pack_version("1.2.x").is_err());
