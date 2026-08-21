@@ -83,10 +83,13 @@ erased-flash `0xFF`), and refuses to write a package unless all privileged-updat
   match the selected board's complete `(board_id, 16-byte DEVICE_NAME field)` identity, and carry the correct
   whole-region IEEE CRC-32 (with its CRC field treated as zero during calculation). `board_id` by itself
   is deliberately insufficient because several boards share the same USB VID/UF2 PID.
-- The image must contain a valid `MOTABLDR` continuity marker advertising apply ABI 3 or newer, the full
-  codec, and the board's exact successor-storage profile: `0x0E` (stage ceiling + QSPI + boot update) for
-  XIAO, or `0x0A` (stage ceiling + boot update, with the normal internal store) for internal-only boards. This
-  prevents installing an older bootloader that could not accept its own signed successor.
+- The image must contain a valid `MOTABLDR` continuity marker advertising apply ABI 3 or newer, both full
+  and in-place codecs (`codec_mask & 0x0005 == 0x0005`), and the board's exact successor-storage profile:
+  `0x0E` (stage ceiling + QSPI + boot update) for
+  XIAO, `0x09` (SD + boot update) for `heltec_mesh_tower_v2_sdcard`, or `0x0A` (stage ceiling + boot update,
+  with the normal internal store) for internal-only boards. The Tower V2 identity may validly advertise
+  either its SD or internal variant; all other identities accept only their listed profile. This prevents
+  installing an older bootloader that could not accept its own signed successor.
 
 The supported routing identities are fixed and signed:
 
@@ -95,7 +98,7 @@ The supported routing identities are fixed and signed:
 | `xiao_nrf52840_ble` | `0x28860044` | `0x28860044` | `XIAO_BL_28860044` / `XIAO_DFU` |
 | `xiao_nrf52840_ble_sense` | `0x28860045` | `0x28860045` | `XIAO_BL_28860045` / `XIAO_DFU` |
 | `heltec_mesh_pocket` | `0x239A0071` | `0x059277F4` | `NRF_BL_239A0071_MESH_POCKET_OTA` / `MESH_POCKET_OTA` |
-| `heltec_mesh_tower_v2` | `0x239A0071` | `0x1150F50E` | `NRF_BL_239A0071_TOWER_V2_OTA` / `TOWER_V2_OTA` |
+| `heltec_mesh_tower_v2` (`heltec_mesh_tower_v2_sdcard` alias) | `0x239A0071` | `0x1150F50E` | `NRF_BL_239A0071_TOWER_V2_OTA` / `TOWER_V2_OTA` |
 | `heltec_t096` | `0x239A0071` | `0x42354C85` | `NRF_BL_239A0071_T096_DFU` / `T096_DFU` |
 | `heltec_t1` | `0x239A0071` | `0xFC556FFC` | `NRF_BL_239A0071_T1_DFU` / `T1_DFU` |
 | `heltec_t114` | `0x239A0071` | `0x0C3F2902` | `NRF_BL_239A0071_T114_DFU` / `T114_DFU` |

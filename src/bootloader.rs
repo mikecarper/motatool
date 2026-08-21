@@ -36,6 +36,8 @@ pub const BOOTLOADER_CAPS_MAGIC: [u8; 8] = *b"MOTABLDR";
 pub const BOOTLOADER_CAPS_SIZE: usize = 16;
 pub const BOOTLOADER_MIN_APPLY_ABI: u16 = 3;
 pub const BOOTLOADER_CODEC_FULL: u16 = 1 << (Codec::Full as u8);
+pub const BOOTLOADER_CODEC_INPLACE: u16 = 1 << (Codec::DetoolsInplace as u8);
+pub const BOOTLOADER_REQUIRED_CODECS: u16 = BOOTLOADER_CODEC_FULL | BOOTLOADER_CODEC_INPLACE;
 pub const BOOTLOADER_STORAGE_SD: u8 = 0x01;
 pub const BOOTLOADER_STORAGE_STAGE_CEILING: u8 = 0x02;
 pub const BOOTLOADER_STORAGE_QSPI: u8 = 0x04;
@@ -48,6 +50,7 @@ pub const BOOTLOADER_QSPI_STORAGE: u8 =
     BOOTLOADER_STORAGE_STAGE_CEILING | BOOTLOADER_STORAGE_QSPI | BOOTLOADER_STORAGE_BOOT_UPDATE;
 pub const BOOTLOADER_INTERNAL_STORAGE: u8 =
     BOOTLOADER_STORAGE_STAGE_CEILING | BOOTLOADER_STORAGE_BOOT_UPDATE;
+pub const BOOTLOADER_SD_STORAGE: u8 = BOOTLOADER_STORAGE_SD | BOOTLOADER_STORAGE_BOOT_UPDATE;
 /// Compatibility name for the XIAO/QSPI successor capability profile.
 pub const BOOTLOADER_REQUIRED_STORAGE: u8 = BOOTLOADER_QSPI_STORAGE;
 
@@ -166,6 +169,15 @@ impl BootloaderBoard {
         match self {
             Self::XiaoNrf52840Ble | Self::XiaoNrf52840BleSense => BOOTLOADER_QSPI_STORAGE,
             _ => BOOTLOADER_INTERNAL_STORAGE,
+        }
+    }
+
+    pub const fn accepts_storage_profile(self, profile: u8) -> bool {
+        match self {
+            Self::HeltecMeshTowerV2 => {
+                profile == BOOTLOADER_INTERNAL_STORAGE || profile == BOOTLOADER_SD_STORAGE
+            }
+            _ => profile == self.storage_profile(),
         }
     }
 
@@ -498,11 +510,11 @@ pub fn parse_bootloader_capabilities(image: &[u8]) -> Result<BootloaderCapabilit
         };
         if capabilities.apply_abi >= BOOTLOADER_MIN_APPLY_ABI
             && capabilities.apply_abi != u16::MAX
-            && capabilities.codec_mask & BOOTLOADER_CODEC_FULL != 0
+            && capabilities.codec_mask & BOOTLOADER_REQUIRED_CODECS == BOOTLOADER_REQUIRED_CODECS
             && capabilities.storage_flags & !BOOTLOADER_KNOWN_STORAGE == 0
             && matches!(
                 capabilities.storage_flags,
-                BOOTLOADER_QSPI_STORAGE | BOOTLOADER_INTERNAL_STORAGE
+                BOOTLOADER_QSPI_STORAGE | BOOTLOADER_INTERNAL_STORAGE | BOOTLOADER_SD_STORAGE
             )
             && image[offset + 13..offset + 16] == [0, 0, 0]
         {
@@ -516,7 +528,7 @@ pub fn parse_bootloader_capabilities(image: &[u8]) -> Result<BootloaderCapabilit
         ),
         _ if magic_matches == 0 => bail!("bootloader image has no MOTABLDR capability marker"),
         _ => bail!(
-            "found {magic_matches} MOTABLDR marker candidate(s), but none are aligned, structurally valid, and advertise finite apply_abi >= {BOOTLOADER_MIN_APPLY_ABI}, CODEC_FULL, and an exact QSPI (0x{BOOTLOADER_QSPI_STORAGE:02X}) or shared-internal (0x{BOOTLOADER_INTERNAL_STORAGE:02X}) boot-update profile"
+            "found {magic_matches} MOTABLDR marker candidate(s), but none are aligned, structurally valid, and advertise finite apply_abi >= {BOOTLOADER_MIN_APPLY_ABI}, CODEC_FULL|CODEC_INPLACE, and an exact SD (0x{BOOTLOADER_SD_STORAGE:02X}), QSPI (0x{BOOTLOADER_QSPI_STORAGE:02X}), or shared-internal (0x{BOOTLOADER_INTERNAL_STORAGE:02X}) boot-update profile"
         ),
     }
 }
@@ -567,11 +579,10 @@ pub fn validate_bootloader_image(
     );
     let capabilities = parse_bootloader_capabilities(image)?;
     ensure!(
-        capabilities.storage_flags == expected.storage_profile(),
-        "embedded MOTABLDR storage profile 0x{:02X} does not match {} (expected 0x{:02X})",
+        expected.accepts_storage_profile(capabilities.storage_flags),
+        "embedded MOTABLDR storage profile 0x{:02X} is not supported for {}",
         capabilities.storage_flags,
-        expected.name(),
-        expected.storage_profile()
+        expected.name()
     );
     Ok(manifest)
 }

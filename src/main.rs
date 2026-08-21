@@ -34,7 +34,7 @@ enum CliBootloaderBoard {
     XiaoNrf52840Ble,
     #[value(name = "xiao_nrf52840_ble_sense", alias = "xiao-nrf52840-ble-sense")]
     XiaoNrf52840BleSense,
-    #[value(name = "heltec_mesh_tower_v2")]
+    #[value(name = "heltec_mesh_tower_v2", alias = "heltec_mesh_tower_v2_sdcard")]
     HeltecMeshTowerV2,
     #[value(name = "heltec_mesh_pocket")]
     HeltecMeshPocket,
@@ -563,10 +563,11 @@ fn cmd_inspect(a: InspectArgs) -> Result<()> {
         println!("caps_storage    : 0x{:02x}", capabilities.storage_flags);
         println!(
             "caps_stage_kind : {}",
-            if capabilities.storage_flags == motatool::bootloader::BOOTLOADER_INTERNAL_STORAGE {
-                "internal"
-            } else {
-                "qspi"
+            match capabilities.storage_flags {
+                motatool::bootloader::BOOTLOADER_INTERNAL_STORAGE => "internal",
+                motatool::bootloader::BOOTLOADER_QSPI_STORAGE => "qspi",
+                motatool::bootloader::BOOTLOADER_SD_STORAGE => "sd",
+                _ => "unknown",
             }
         );
     }

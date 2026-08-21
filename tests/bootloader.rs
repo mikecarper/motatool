@@ -24,7 +24,7 @@ fn wr_u32(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
-fn make_image(board: BootloaderBoard) -> Vec<u8> {
+fn make_image_with_storage(board: BootloaderBoard, storage_profile: u8) -> Vec<u8> {
     let mut image = vec![0xFF; BOOTLOADER_IMAGE_SIZE];
 
     // Plausible nRF52840 vector table at the beginning of the copied region.
@@ -37,7 +37,7 @@ fn make_image(board: BootloaderBoard) -> Vec<u8> {
     image[CAPS_OFFSET..CAPS_OFFSET + 8].copy_from_slice(&BOOTLOADER_CAPS_MAGIC);
     wr_u16(&mut image, CAPS_OFFSET + 8, BOOTLOADER_MIN_APPLY_ABI);
     wr_u16(&mut image, CAPS_OFFSET + 10, 0x0005); // full + in-place codecs
-    image[CAPS_OFFSET + 12] = board.storage_profile();
+    image[CAPS_OFFSET + 12] = storage_profile;
     image[CAPS_OFFSET + 13..CAPS_OFFSET + 16].fill(0);
 
     // Likewise, a bare magic pair is not a complete embedded update manifest.
@@ -78,6 +78,10 @@ fn make_image(board: BootloaderBoard) -> Vec<u8> {
     image[MANIFEST_OFFSET + 24..MANIFEST_OFFSET + 24 + name.len()].copy_from_slice(name);
     rewrite_image_crc(&mut image);
     image
+}
+
+fn make_image(board: BootloaderBoard) -> Vec<u8> {
+    make_image_with_storage(board, board.storage_profile())
 }
 
 fn rewrite_image_crc(image: &mut [u8]) {
@@ -251,6 +255,45 @@ fn shared_internal_boot_package_geometry_is_pinned() {
         .into_iter()
         .filter(|board| board.storage_profile() == BOOTLOADER_INTERNAL_STORAGE)
         .all(|board| board.storage_profile() == 0x0A));
+}
+
+#[test]
+fn mesh_tower_sd_profile_is_exact_and_board_scoped() {
+    let tower = BootloaderBoard::HeltecMeshTowerV2;
+    let image = make_image_with_storage(tower, BOOTLOADER_SD_STORAGE);
+    let capabilities = parse_bootloader_capabilities(&image).unwrap();
+    assert_eq!(capabilities.storage_flags, 0x09);
+    assert_eq!(
+        validate_bootloader_image(&image, tower).unwrap().board_id,
+        0x239A_0071
+    );
+
+    let built = build_bootloader(&opts(image.clone(), tower)).unwrap();
+    assert!(verify(&built.bytes).is_empty());
+    let manifest = Manifest::parse(&built.bytes).unwrap();
+    assert_eq!(manifest.target_id, 0x1150_F50E);
+    assert_eq!(manifest.hw_id_str(), "NRF_BL_239A0071_TOWER_V2_OTA");
+    let payload = &built.bytes
+        [manifest.payload_off()..manifest.payload_off() + manifest.payload_size as usize];
+    assert_eq!(payload, image);
+
+    let rak = BootloaderBoard::WiscoreRak3401;
+    let error =
+        validate_bootloader_image(&make_image_with_storage(rak, BOOTLOADER_SD_STORAGE), rak)
+            .unwrap_err()
+            .to_string();
+    assert!(
+        error.contains("is not supported for wiscore_rak3401"),
+        "{error}"
+    );
+
+    let mut bare_sd = make_image(tower);
+    bare_sd[CAPS_OFFSET + 12] = BOOTLOADER_STORAGE_SD;
+    rewrite_image_crc(&mut bare_sd);
+    let error = parse_bootloader_capabilities(&bare_sd)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("structurally valid"), "{error}");
 }
 
 #[test]
@@ -570,6 +613,19 @@ fn vectors_and_successor_capability_are_required() {
         .to_string();
     assert!(error.contains("CODEC_FULL"), "{error}");
 
+    let mut no_inplace_codec = make_image(board);
+    wr_u16(
+        &mut no_inplace_codec,
+        CAPS_OFFSET + 10,
+        BOOTLOADER_CODEC_FULL,
+    );
+    rewrite_image_crc(&mut no_inplace_codec);
+    let error = build_bootloader(&opts(no_inplace_codec, board))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("CODEC_INPLACE"), "{error}");
+
     let mut no_boot_update = make_image(board);
     no_boot_update[CAPS_OFFSET + 12] = BOOTLOADER_STORAGE_QSPI;
     rewrite_image_crc(&mut no_boot_update);
@@ -577,7 +633,7 @@ fn vectors_and_successor_capability_are_required() {
         .err()
         .unwrap()
         .to_string();
-    assert!(error.contains("exact QSPI"), "{error}");
+    assert!(error.contains("boot-update profile"), "{error}");
 
     let mut unknown_storage = make_image(board);
     unknown_storage[CAPS_OFFSET + 12] = BOOTLOADER_REQUIRED_STORAGE | 0x80;
@@ -596,7 +652,10 @@ fn vectors_and_successor_capability_are_required() {
         .err()
         .unwrap()
         .to_string();
-    assert!(error.contains("does not match wiscore_rak3401"), "{error}");
+    assert!(
+        error.contains("is not supported for wiscore_rak3401"),
+        "{error}"
+    );
 
     let mut nonzero_reserved = make_image(board);
     nonzero_reserved[CAPS_OFFSET + 13] = 1;
@@ -777,6 +836,50 @@ fn cli_builds_from_hex_and_labels_bootloader_packages() {
     );
     assert!(stdout.contains("caps_storage    : 0x0a"), "{stdout}");
     assert!(stdout.contains("caps_stage_kind : internal"), "{stdout}");
+
+    let tower = BootloaderBoard::HeltecMeshTowerV2;
+    let tower_image = make_image_with_storage(tower, BOOTLOADER_SD_STORAGE);
+    let tower_hex = dir.path().join("tower_v2_sd_bootloader.hex");
+    let tower_out = dir.path().join("tower_v2_sd.mota");
+    std::fs::write(&tower_hex, image_as_intel_hex(&tower_image)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_motatool"))
+        .args([
+            "build-bootloader",
+            "--fw",
+            tower_hex.to_str().unwrap(),
+            "--board",
+            "heltec_mesh_tower_v2_sdcard",
+            "--sign",
+            key_path.to_str().unwrap(),
+            "--fw-version",
+            "1.2.3",
+            "--out",
+            tower_out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let blob = std::fs::read(&tower_out).unwrap();
+    assert!(verify(&blob).is_empty());
+    let manifest = Manifest::parse(&blob).unwrap();
+    assert_eq!(manifest.target_id, 0x1150_F50E);
+    assert_eq!(manifest.hw_id_str(), "NRF_BL_239A0071_TOWER_V2_OTA");
+    let inspect = Command::new(env!("CARGO_BIN_EXE_motatool"))
+        .args(["inspect", tower_out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(inspect.status.success());
+    let stdout = String::from_utf8_lossy(&inspect.stdout);
+    assert!(
+        stdout.contains("bootloader_board: heltec_mesh_tower_v2"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("caps_storage    : 0x09"), "{stdout}");
+    assert!(stdout.contains("caps_stage_kind : sd"), "{stdout}");
 }
 
 fn image_as_intel_hex(image: &[u8]) -> String {
