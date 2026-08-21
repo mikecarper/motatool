@@ -6,7 +6,6 @@
 
 use crate::build::Built;
 use crate::crypto::{ed25519_public_from_seed, ed25519_sign, sha256};
-use crate::endf::version_str;
 use crate::format::*;
 use crate::merkle;
 use anyhow::{bail, ensure, Context, Result};
@@ -28,6 +27,29 @@ pub const UPDATE_MANIFEST_VERSION: u16 = 1;
 pub const UPDATE_MANIFEST_SIZE: usize = 44;
 pub const UPDATE_MANIFEST_DEVICE_NAME_SIZE: usize = 16;
 pub const UPDATE_MANIFEST_CRC_OFFSET: usize = 40;
+pub const UPDATE_COMPAT_MAGIC0: u32 = 0x324D_4C42; // "BLM2" in little-endian flash order
+pub const UPDATE_COMPAT_MAGIC1: u32 = 0x5446_4F53; // "SOFT" in little-endian flash order
+pub const UPDATE_COMPAT_VERSION: u16 = 2;
+pub const UPDATE_COMPAT_SIZE: usize = 32;
+pub const UPDATE_COMPAT_OFFSET: usize = UPDATE_MANIFEST_SIZE;
+pub const UPDATE_MANIFEST_ENVELOPE_SIZE: usize = UPDATE_MANIFEST_SIZE + UPDATE_COMPAT_SIZE;
+pub const UPDATE_COMPAT_BOOT_VERSION_OFFSET: usize = 12;
+pub const UPDATE_COMPAT_SD_FAMILY_OFFSET: usize = 16;
+pub const UPDATE_COMPAT_SD_FWID_OFFSET: usize = 18;
+pub const UPDATE_COMPAT_APP_BASE_OFFSET: usize = 20;
+pub const UPDATE_COMPAT_LAYOUT_ABI_OFFSET: usize = 24;
+pub const UPDATE_COMPAT_FLAGS_OFFSET: usize = 26;
+pub const UPDATE_COMPAT_RESERVED_OFFSET: usize = 28;
+pub const UPDATE_MANIFEST_OFFSET: usize = 0x0000_9FB4;
+const _: () =
+    assert!(UPDATE_MANIFEST_OFFSET + UPDATE_MANIFEST_ENVELOPE_SIZE == BOOTLOADER_IMAGE_SIZE);
+
+pub const SOFTDEVICE_FAMILY_S140: u16 = 140;
+pub const SOFTDEVICE_S140_6_1_1_FWID: u16 = 0x00B6;
+pub const SOFTDEVICE_S140_7_3_0_FWID: u16 = 0x0123;
+pub const SOFTDEVICE_S140_6_1_1_APP_BASE: u32 = 0x0002_6000;
+pub const SOFTDEVICE_S140_7_3_0_APP_BASE: u32 = 0x0002_7000;
+pub const BOOTLOADER_LAYOUT_ABI: u16 = 1;
 
 pub const XIAO_NRF52840_BLE_BOARD_ID: u32 = 0x2886_0044;
 pub const XIAO_NRF52840_BLE_SENSE_BOARD_ID: u32 = 0x2886_0045;
@@ -181,6 +203,34 @@ impl BootloaderBoard {
         }
     }
 
+    pub const fn profile_name(self, profile: u8) -> Option<&'static str> {
+        match (self, profile) {
+            (Self::HeltecMeshTowerV2, BOOTLOADER_SD_STORAGE) => Some("heltec_mesh_tower_v2_sdcard"),
+            _ if profile == self.storage_profile() => Some(self.name()),
+            _ => None,
+        }
+    }
+
+    pub const fn compatibility(self) -> BootloaderCompatibility {
+        match self {
+            Self::XiaoNrf52840Ble
+            | Self::XiaoNrf52840BleSense
+            | Self::MinewsemiMx25le01
+            | Self::T1000E => BootloaderCompatibility {
+                softdevice_family: SOFTDEVICE_FAMILY_S140,
+                softdevice_fwid: SOFTDEVICE_S140_7_3_0_FWID,
+                app_base: SOFTDEVICE_S140_7_3_0_APP_BASE,
+                layout_abi: BOOTLOADER_LAYOUT_ABI,
+            },
+            _ => BootloaderCompatibility {
+                softdevice_family: SOFTDEVICE_FAMILY_S140,
+                softdevice_fwid: SOFTDEVICE_S140_6_1_1_FWID,
+                app_base: SOFTDEVICE_S140_6_1_1_APP_BASE,
+                layout_abi: BOOTLOADER_LAYOUT_ABI,
+            },
+        }
+    }
+
     pub fn target_id(self) -> u32 {
         match self {
             Self::XiaoNrf52840Ble | Self::XiaoNrf52840BleSense => self.board_id(),
@@ -220,6 +270,16 @@ impl BootloaderBoard {
     }
 }
 
+/// SoftDevice and flash-layout identity that must remain compatible across an application-preserving
+/// bootloader update.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BootloaderCompatibility {
+    pub softdevice_family: u16,
+    pub softdevice_fwid: u16,
+    pub app_base: u32,
+    pub layout_abi: u16,
+}
+
 /// Check the checked-in inventory itself before trusting a hash-derived routing target.
 pub fn validate_bootloader_inventory() -> Result<()> {
     for (index, board) in BOOTLOADER_BOARDS.iter().copied().enumerate() {
@@ -235,6 +295,18 @@ pub fn validate_bootloader_inventory() -> Result<()> {
         ensure!(
             board.target_id() != 0 && board.target_id() != u32::MAX,
             "invalid bootloader target_id"
+        );
+        let compatibility = board.compatibility();
+        ensure!(
+            compatibility.softdevice_family == SOFTDEVICE_FAMILY_S140
+                && matches!(
+                    (compatibility.softdevice_fwid, compatibility.app_base),
+                    (SOFTDEVICE_S140_6_1_1_FWID, SOFTDEVICE_S140_6_1_1_APP_BASE)
+                        | (SOFTDEVICE_S140_7_3_0_FWID, SOFTDEVICE_S140_7_3_0_APP_BASE)
+                )
+                && compatibility.layout_abi == BOOTLOADER_LAYOUT_ABI,
+            "invalid SoftDevice/layout compatibility inventory for {}",
+            board.name()
         );
         if let Some(application) = crate::targets::env_name(board.target_id()) {
             bail!(
@@ -269,7 +341,7 @@ pub fn validate_bootloader_inventory() -> Result<()> {
     Ok(())
 }
 
-/// The embedded 44-byte OTAFIX bootloader update manifest after validation.
+/// The embedded OTAFIX legacy manifest plus its adjacent compatibility extension after validation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BootloaderUpdateManifest {
     pub offset: usize,
@@ -278,6 +350,12 @@ pub struct BootloaderUpdateManifest {
     pub board_id: u32,
     pub device_name: [u8; UPDATE_MANIFEST_DEVICE_NAME_SIZE],
     pub crc32: u32,
+    pub bootloader_version: u32,
+    pub softdevice_family: u16,
+    pub softdevice_fwid: u16,
+    pub app_base: u32,
+    pub layout_abi: u16,
+    pub compat_flags: u16,
 }
 
 /// The continuity marker read by the running application before it stages a future update.
@@ -292,6 +370,21 @@ pub struct BootloaderCapabilities {
 impl BootloaderUpdateManifest {
     pub fn device_name_str(&self) -> String {
         cstr(&self.device_name)
+    }
+}
+
+/// Render the OTAFIX release ordering encoded by the compatibility extension. Preview numbers 1..=254
+/// sort before the stable release marker 0xFF for the same X.Y.Z tuple.
+pub fn bootloader_version_str(version: u32) -> String {
+    let base = format!(
+        "{}.{}.{}",
+        (version >> 24) & 0xFF,
+        (version >> 16) & 0xFF,
+        (version >> 8) & 0xFF
+    );
+    match version & 0xFF {
+        0xFF => base,
+        preview => format!("{base}-preview.{preview}"),
     }
 }
 
@@ -319,7 +412,9 @@ pub struct BootloaderBuildOpts {
     /// Exact padded bytes for [`BOOTLOADER_IMAGE_START`]..[`BOOTLOADER_IMAGE_END`].
     pub image: Vec<u8>,
     pub board: BootloaderBoard,
-    pub fw_version: u32,
+    /// Exact successor storage profile selected by the operator. This is separate from the physical
+    /// board identity because MeshTower V2 has distinct internal-flash and SD-card bootloader builds.
+    pub storage_profile: u8,
     /// Bootloader packages are never allowed to be unsigned, so this is not optional.
     pub sign_seed: [u8; 32],
 }
@@ -398,8 +493,11 @@ pub fn bootloader_image_crc32(image: &[u8], crc_offset: usize) -> u32 {
     !crc
 }
 
-/// Locate the sole fully valid v1 OTAFIX manifest. Magic/version constants can also occur in literal
-/// pools, so an invalid candidate must not shadow a valid manifest later in the image.
+/// Locate the sole fully valid OTAFIX manifest envelope. The original 44-byte v1 header stays intact so
+/// an eligible internal/QSPI legacy updater can bootstrap this image, while motatool requires the immediately
+/// adjacent BLM2/SOFT continuity extension. MeshTower SD requires local BLM2 provisioning instead. Magic
+/// constants can also occur in literal pools, so an invalid candidate must not shadow a valid manifest later
+/// in the image.
 pub fn parse_bootloader_update_manifest(image: &[u8]) -> Result<BootloaderUpdateManifest> {
     ensure!(
         image.len() == BOOTLOADER_IMAGE_SIZE,
@@ -409,9 +507,13 @@ pub fn parse_bootloader_update_manifest(image: &[u8]) -> Result<BootloaderUpdate
     validate_bootloader_vectors(image)?;
     parse_bootloader_capabilities(image)?;
 
-    // Only candidates whose complete identity, geometry, and whole-image CRC validate count. Retain the
-    // last rejection solely to make a lone corrupt real manifest easier to diagnose.
-    let mut candidates = Vec::new();
+    // Count every structurally and CRC-valid legacy BLMF before interpreting adjacent bytes. This is
+    // intentionally base-first: a deployed v1 updater does not understand BLM2 and still sees a BLMF
+    // whose extension is missing or corrupt. Only after proving there is one identity may that sole
+    // identity establish the required BLM2 continuity metadata. Retain the last rejection solely to make
+    // a lone corrupt real manifest easier to diagnose.
+    let mut valid_identity_count = 0usize;
+    let mut continuity_candidate = None;
     let mut last_rejection = None;
     for offset in (0..=image.len() - UPDATE_MANIFEST_SIZE).step_by(4) {
         if rd_u32(image, offset) != UPDATE_MANIFEST_MAGIC0
@@ -428,13 +530,19 @@ pub fn parse_bootloader_update_manifest(image: &[u8]) -> Result<BootloaderUpdate
             continue;
         }
 
-        let manifest = BootloaderUpdateManifest {
+        let mut manifest = BootloaderUpdateManifest {
             offset,
             image_start: rd_u32(image, offset + 12),
             image_size: rd_u32(image, offset + 16),
             board_id: rd_u32(image, offset + 20),
             device_name: arr(image, offset + 24),
             crc32: rd_u32(image, offset + UPDATE_MANIFEST_CRC_OFFSET),
+            bootloader_version: 0,
+            softdevice_family: 0,
+            softdevice_fwid: 0,
+            app_base: 0,
+            layout_abi: 0,
+            compat_flags: 0,
         };
         if manifest.image_start != BOOTLOADER_IMAGE_START {
             last_rejection = Some(format!(
@@ -458,12 +566,15 @@ pub fn parse_bootloader_update_manifest(image: &[u8]) -> Result<BootloaderUpdate
             last_rejection = Some(error.to_string());
             continue;
         }
-        if BootloaderBoard::from_identity(manifest.board_id, &manifest.device_name).is_none() {
-            last_rejection = Some(format!(
-                "unsupported exact identity board_id=0x{:08X} DEVICE_NAME={:?}",
-                manifest.board_id,
-                manifest.device_name_str()
-            ));
+        if matches!(
+            manifest.board_id,
+            XIAO_NRF52840_BLE_BOARD_ID | XIAO_NRF52840_BLE_SENSE_BOARD_ID
+        ) && manifest.device_name != BootloaderBoard::XiaoNrf52840Ble.padded_device_name()
+        {
+            last_rejection = Some(
+                "unsupported exact identity: XIAO bootloader identity requires XIAO_DFU name"
+                    .to_owned(),
+            );
             continue;
         }
         let computed = bootloader_image_crc32(image, offset + UPDATE_MANIFEST_CRC_OFFSET);
@@ -474,10 +585,104 @@ pub fn parse_bootloader_update_manifest(image: &[u8]) -> Result<BootloaderUpdate
             ));
             continue;
         }
-        candidates.push(manifest);
+        valid_identity_count += 1;
+
+        if offset + UPDATE_MANIFEST_ENVELOPE_SIZE <= image.len() {
+            let compatibility_offset = offset + UPDATE_COMPAT_OFFSET;
+            let compatibility_magic0 = rd_u32(image, compatibility_offset);
+            let compatibility_magic1 = rd_u32(image, compatibility_offset + 4);
+            let continuity_claimed = compatibility_magic0 == UPDATE_COMPAT_MAGIC0
+                || compatibility_magic1 == UPDATE_COMPAT_MAGIC1;
+            if continuity_claimed {
+                if compatibility_magic0 != UPDATE_COMPAT_MAGIC0
+                    || compatibility_magic1 != UPDATE_COMPAT_MAGIC1
+                {
+                    last_rejection =
+                        Some("corrupt adjacent BLM2/SOFT compatibility magic".to_owned());
+                    continue;
+                }
+                if rd_u16(image, compatibility_offset + 8) != UPDATE_COMPAT_VERSION {
+                    last_rejection = Some("compatibility extension version mismatch".to_owned());
+                    continue;
+                }
+                if rd_u16(image, compatibility_offset + 10) as usize != UPDATE_COMPAT_SIZE {
+                    last_rejection =
+                        Some("compatibility extension header_size mismatch".to_owned());
+                    continue;
+                }
+
+                manifest.bootloader_version = rd_u32(
+                    image,
+                    compatibility_offset + UPDATE_COMPAT_BOOT_VERSION_OFFSET,
+                );
+                manifest.softdevice_family =
+                    rd_u16(image, compatibility_offset + UPDATE_COMPAT_SD_FAMILY_OFFSET);
+                manifest.softdevice_fwid =
+                    rd_u16(image, compatibility_offset + UPDATE_COMPAT_SD_FWID_OFFSET);
+                manifest.app_base =
+                    rd_u32(image, compatibility_offset + UPDATE_COMPAT_APP_BASE_OFFSET);
+                manifest.layout_abi = rd_u16(
+                    image,
+                    compatibility_offset + UPDATE_COMPAT_LAYOUT_ABI_OFFSET,
+                );
+                manifest.compat_flags =
+                    rd_u16(image, compatibility_offset + UPDATE_COMPAT_FLAGS_OFFSET);
+                if manifest.bootloader_version == u32::MAX
+                    || manifest.bootloader_version & 0xFF == 0
+                {
+                    last_rejection = Some(format!(
+                        "invalid embedded bootloader version 0x{:08X}",
+                        manifest.bootloader_version
+                    ));
+                    continue;
+                }
+                if manifest.softdevice_family == 0
+                    || manifest.softdevice_fwid == 0
+                    || manifest.app_base == 0
+                    || manifest.layout_abi == 0
+                {
+                    last_rejection =
+                        Some("invalid SoftDevice/layout compatibility fields".to_owned());
+                    continue;
+                }
+                if manifest.compat_flags != 0
+                    || rd_u32(image, compatibility_offset + UPDATE_COMPAT_RESERVED_OFFSET) != 0
+                {
+                    last_rejection = Some(
+                        "compatibility extension flags/reserved fields must be zero".to_owned(),
+                    );
+                    continue;
+                }
+                continuity_candidate = Some(manifest);
+            } else {
+                last_rejection =
+                    Some("missing adjacent BLM2/SOFT compatibility extension".to_owned());
+            }
+        } else {
+            last_rejection = Some("missing adjacent BLM2/SOFT compatibility extension".to_owned());
+        }
     }
-    match candidates.len() {
-        1 => Ok(candidates.pop().unwrap()),
+    match valid_identity_count {
+        1 => {
+            let Some(manifest) = continuity_candidate else {
+                bail!(
+                    "sole fully valid legacy BLMF identity does not carry a valid adjacent BLM2/SOFT compatibility extension: {}",
+                    last_rejection.as_deref().unwrap_or("missing adjacent BLM2/SOFT compatibility extension")
+                );
+            };
+            ensure!(
+                manifest.offset == UPDATE_MANIFEST_OFFSET,
+                "bootloader manifest envelope must occupy the final 76 bytes at image offset 0x{UPDATE_MANIFEST_OFFSET:04X} (found 0x{:04X})",
+                manifest.offset
+            );
+            ensure!(
+                BootloaderBoard::from_identity(manifest.board_id, &manifest.device_name).is_some(),
+                "unsupported exact identity board_id=0x{:08X} DEVICE_NAME={:?}",
+                manifest.board_id,
+                manifest.device_name_str()
+            );
+            Ok(manifest)
+        }
         0 => bail!(
             "no fully valid bootloader update manifest{}",
             last_rejection
@@ -512,10 +717,7 @@ pub fn parse_bootloader_capabilities(image: &[u8]) -> Result<BootloaderCapabilit
             && capabilities.apply_abi != u16::MAX
             && capabilities.codec_mask & BOOTLOADER_REQUIRED_CODECS == BOOTLOADER_REQUIRED_CODECS
             && capabilities.storage_flags & !BOOTLOADER_KNOWN_STORAGE == 0
-            && matches!(
-                capabilities.storage_flags,
-                BOOTLOADER_QSPI_STORAGE | BOOTLOADER_INTERNAL_STORAGE | BOOTLOADER_SD_STORAGE
-            )
+            && capabilities.storage_flags & BOOTLOADER_STORAGE_BOOT_UPDATE != 0
             && image[offset + 13..offset + 16] == [0, 0, 0]
         {
             candidates.push(capabilities);
@@ -528,7 +730,7 @@ pub fn parse_bootloader_capabilities(image: &[u8]) -> Result<BootloaderCapabilit
         ),
         _ if magic_matches == 0 => bail!("bootloader image has no MOTABLDR capability marker"),
         _ => bail!(
-            "found {magic_matches} MOTABLDR marker candidate(s), but none are aligned, structurally valid, and advertise finite apply_abi >= {BOOTLOADER_MIN_APPLY_ABI}, CODEC_FULL|CODEC_INPLACE, and an exact SD (0x{BOOTLOADER_SD_STORAGE:02X}), QSPI (0x{BOOTLOADER_QSPI_STORAGE:02X}), or shared-internal (0x{BOOTLOADER_INTERNAL_STORAGE:02X}) boot-update profile"
+            "found {magic_matches} MOTABLDR marker candidate(s), but none are aligned, structurally valid, and advertise finite apply_abi >= {BOOTLOADER_MIN_APPLY_ABI}, CODEC_FULL|CODEC_INPLACE, and a boot-update profile using only known storage flags"
         ),
     }
 }
@@ -563,6 +765,17 @@ pub fn validate_bootloader_image(
     image: &[u8],
     expected: BootloaderBoard,
 ) -> Result<BootloaderUpdateManifest> {
+    validate_bootloader_image_for_profile(image, expected, expected.storage_profile())
+}
+
+/// Validate the embedded manifest and exact successor storage profile against the selected OTAFIX
+/// deployment variant. Most boards have one profile; MeshTower V2 deliberately has internal and SD
+/// variants with the same physical board identity.
+pub fn validate_bootloader_image_for_profile(
+    image: &[u8],
+    expected: BootloaderBoard,
+    expected_storage_profile: u8,
+) -> Result<BootloaderUpdateManifest> {
     let manifest = parse_bootloader_update_manifest(image)?;
     ensure!(
         manifest.board_id == expected.board_id(),
@@ -577,11 +790,38 @@ pub fn validate_bootloader_image(
         manifest.device_name_str(),
         expected.device_name()
     );
+    let expected_compatibility = expected.compatibility();
+    let embedded_compatibility = BootloaderCompatibility {
+        softdevice_family: manifest.softdevice_family,
+        softdevice_fwid: manifest.softdevice_fwid,
+        app_base: manifest.app_base,
+        layout_abi: manifest.layout_abi,
+    };
+    ensure!(
+        embedded_compatibility == expected_compatibility,
+        "embedded SoftDevice/layout family={} FWID=0x{:04X} app_base=0x{:08X} ABI={} does not match {} inventory family={} FWID=0x{:04X} app_base=0x{:08X} ABI={}",
+        embedded_compatibility.softdevice_family,
+        embedded_compatibility.softdevice_fwid,
+        embedded_compatibility.app_base,
+        embedded_compatibility.layout_abi,
+        expected.name(),
+        expected_compatibility.softdevice_family,
+        expected_compatibility.softdevice_fwid,
+        expected_compatibility.app_base,
+        expected_compatibility.layout_abi,
+    );
     let capabilities = parse_bootloader_capabilities(image)?;
     ensure!(
-        expected.accepts_storage_profile(capabilities.storage_flags),
-        "embedded MOTABLDR storage profile 0x{:02X} is not supported for {}",
+        expected.accepts_storage_profile(expected_storage_profile),
+        "selected MOTABLDR storage profile 0x{:02X} is not supported for {}",
+        expected_storage_profile,
+        expected.name()
+    );
+    ensure!(
+        capabilities.storage_flags == expected_storage_profile,
+        "embedded MOTABLDR storage profile 0x{:02X} does not match selected profile 0x{:02X} for {}",
         capabilities.storage_flags,
+        expected_storage_profile,
         expected.name()
     );
     Ok(manifest)
@@ -606,8 +846,8 @@ pub fn validate_bootloader_package(
         "bootloader package must use SHA-256"
     );
     ensure!(
-        manifest.fw_version != 0,
-        "bootloader package fw_version must be nonzero"
+        manifest.fw_version != 0 && manifest.fw_version != u32::MAX,
+        "bootloader package fw_version must be finite and nonzero"
     );
     ensure!(
         manifest.codec() == Some(Codec::Full),
@@ -629,6 +869,12 @@ pub fn validate_bootloader_package(
         "bootloader package base_hash must be zero"
     );
     let embedded = parse_bootloader_update_manifest(payload)?;
+    ensure!(
+        manifest.fw_version == embedded.bootloader_version,
+        "bootloader package fw_version {} does not match embedded bootloader version {}",
+        bootloader_version_str(manifest.fw_version),
+        bootloader_version_str(embedded.bootloader_version)
+    );
     let board = BootloaderBoard::from_identity(embedded.board_id, &embedded.device_name)
         .context("unsupported exact embedded bootloader identity")?;
     ensure!(
@@ -643,17 +889,19 @@ pub fn validate_bootloader_package(
         "bootloader hw_id must be canonical NUL-padded {:?}",
         board.hw_id()
     );
-    validate_bootloader_image(payload, board)
+    let capabilities = parse_bootloader_capabilities(payload)?;
+    validate_bootloader_image_for_profile(payload, board, capabilities.storage_flags)
 }
 
 /// Build a signed, exact-board bootloader package from an already extracted 40 KiB region.
 pub fn build_bootloader(options: &BootloaderBuildOpts) -> Result<Built> {
     validate_bootloader_inventory()?;
-    validate_bootloader_image(&options.image, options.board)?;
-    ensure!(
-        options.fw_version != 0,
-        "bootloader package fw_version must be nonzero"
-    );
+    let embedded = validate_bootloader_image_for_profile(
+        &options.image,
+        options.board,
+        options.storage_profile,
+    )?;
+    let fw_version = embedded.bootloader_version;
     let leaves = merkle::leaf_hashes(&options.image, BOOTLOADER_BLOCK_SIZE as usize);
     ensure!(
         leaves.len() == BOOTLOADER_BLOCK_COUNT as usize,
@@ -668,7 +916,7 @@ pub fn build_bootloader(options: &BootloaderBuildOpts) -> Result<Built> {
     mf[off::FLAGS] = BOOTLOADER_FLAGS;
     mf[off::HASH_ALGO] = HASH_ALGO_SHA256;
     wr_u32(&mut mf, off::TARGET_ID, options.board.target_id());
-    wr_u32(&mut mf, off::FW_VERSION, options.fw_version);
+    wr_u32(&mut mf, off::FW_VERSION, fw_version);
     wr_u32(&mut mf, off::IMAGE_SIZE, BOOTLOADER_IMAGE_SIZE as u32);
     wr_u32(&mut mf, off::PAYLOAD_SIZE, BOOTLOADER_IMAGE_SIZE as u32);
     mf[off::BLOCK_SIZE_LOG2] = 10;
@@ -700,7 +948,7 @@ pub fn build_bootloader(options: &BootloaderBuildOpts) -> Result<Built> {
     let suggested_name = format!(
         "{}_v{}_bootloader_{}.mota",
         options.board.hw_id(),
-        version_str(options.fw_version),
+        bootloader_version_str(fw_version),
         hex::encode_upper(root)
     );
     Ok(Built {

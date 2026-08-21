@@ -143,26 +143,31 @@ pub fn target_id_for_env(env: &str) -> u32 {
     rd_u32(&mh::<4>(env.as_bytes()), 0)
 }
 
-/// Pack `"a.b.c[.d]"` into a u32 (each dotted part clamped to a byte: `a<<24 | b<<16 | c<<8 | d`).
+/// Pack `"a.b.c[.d]"` into a u32 (`a<<24 | b<<16 | c<<8 | d`). Every component must fit one byte;
+/// extra components are rejected instead of being silently truncated.
 pub fn pack_version(s: &str) -> Result<u32> {
     let mut parts = [0u32; 4];
     let mut n = 0;
-    for tok in s.split('.').take(4) {
+    for tok in s.split('.') {
+        if n == parts.len() {
+            bail!("too many version components: {s:?}");
+        }
         if tok.is_empty() || !tok.bytes().all(|b| b.is_ascii_digit()) {
             bail!("bad version: {s:?}");
         }
-        parts[n] = tok
+        let value: u32 = tok
             .parse()
             .map_err(|_| anyhow::anyhow!("version component too large: {s:?}"))?;
+        if value > u8::MAX as u32 {
+            bail!("version component exceeds 255: {s:?}");
+        }
+        parts[n] = value;
         n += 1;
     }
     if n == 0 {
         bail!("bad version: {s:?}");
     }
-    Ok(((parts[0] & 0xFF) << 24)
-        | ((parts[1] & 0xFF) << 16)
-        | ((parts[2] & 0xFF) << 8)
-        | (parts[3] & 0xFF))
+    Ok((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3])
 }
 
 /// Render the packed version, including a nonzero fourth byte.
@@ -194,6 +199,8 @@ mod tests {
         assert!(pack_version("1..2").is_err());
         assert!(pack_version("").is_err());
         assert!(pack_version("1.2.x").is_err());
+        assert!(pack_version("256.2.3").is_err());
+        assert!(pack_version("1.2.3.4.5").is_err());
     }
 
     #[test]

@@ -17,7 +17,8 @@ pub mod targets;
 pub mod verify;
 
 pub use bootloader::{
-    build_bootloader, validate_bootloader_inventory, BootloaderBoard, BootloaderBuildOpts,
+    bootloader_version_str, build_bootloader, validate_bootloader_image_for_profile,
+    validate_bootloader_inventory, BootloaderBoard, BootloaderBuildOpts, BootloaderCompatibility,
     BootloaderUpdateManifest, BOOTLOADER_BOARDS,
 };
 pub use build::{build, BuildOpts, Built};

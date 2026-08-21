@@ -42,11 +42,13 @@ motatool build --fw firmware.hex --out-dir ./motas
 motatool build --fw firmware.bin --sign signer.key --out-dir ./motas   # signed
 motatool build --fw https://example.org/RAK_4631_repeater.bin          # straight from a URL
 
-# package an OTAFIX bootloader (signature and nonzero version are mandatory)
+# package an OTAFIX bootloader (the version is derived from embedded build metadata)
 motatool build-bootloader --fw xiao_bootloader.hex --board xiao_nrf52840_ble \
-  --fw-version 1.2.3 --sign signer.key --out-dir ./motas
+  --sign signer.key --out-dir ./motas
 motatool build-bootloader --fw rak3401_bootloader.hex --board wiscore_rak3401 \
-  --fw-version 1.2.3 --sign signer.key --out-dir ./motas
+  --sign signer.key --out-dir ./motas
+motatool build-bootloader --fw tower_sd_bootloader.hex --board heltec_mesh_tower_v2_sdcard \
+  --sign signer.key --out-dir ./motas
 
 # check containers (per-file OK / FAIL; non-zero exit if any fails)
 motatool verify ./motas/*.mota
@@ -73,23 +75,70 @@ first. Firmware identity comes from the image's `EndF` trailer, overridable with
 accepts an Intel HEX, extracts exactly `0xF4000..0xFE000` into a 40 KiB payload (filling HEX gaps with
 erased-flash `0xFF`), and refuses to write a package unless all privileged-update gates pass:
 
-- `--sign` and a nonzero `--fw-version` are mandatory; the package is format **v3** with flags exactly
+- `--sign` and a finite, nonzero embedded bootloader version are mandatory; the package is format **v3** with flags exactly
   `FULL|SIGNED|BOOTLOADER`, `CODEC_FULL`, and exactly 40 blocks of 1024 bytes. Ordinary application
   packages remain format v2. The complete bootloader container is exactly 41,330 bytes. This makes older
-  v2-only firmware reject bootloader bytes instead of treating them as an application image.
+  v2-only firmware reject bootloader bytes instead of treating them as an application image. The package
+  version is copied from the bootloader image, never invented at packaging time. Optional `--fw-version`
+  is only a four-byte dotted assertion (`2.4.1.12` for preview 12 or `2.4.1.255` for stable); a mismatch is
+  rejected.
+- OTAFIX release ordering is encoded as `X<<24 | Y<<16 | Z<<8 | channel`: preview N uses channel 1..254,
+  while a stable X.Y.Z release uses `0xFF`, so stable sorts after every preview of the same release. Channel
+  zero, an all-ones version, or a component outside one byte is invalid.
 - The nRF52840 initial stack pointer must be 8-byte aligned and in RAM, and the reset vector must be a
   Thumb address inside the bootloader region. An erased image is rejected.
 - The 44-byte OTAFIX `bootloader_update_manifest` v1 must be unique, declare the exact region geometry,
   match the selected board's complete `(board_id, 16-byte DEVICE_NAME field)` identity, and carry the correct
   whole-region IEEE CRC-32 (with its CRC field treated as zero during calculation). `board_id` by itself
-  is deliberately insufficient because several boards share the same USB VID/UF2 PID.
-- The image must contain a valid `MOTABLDR` continuity marker advertising apply ABI 3 or newer, both full
-  and in-place codecs (`codec_mask & 0x0005 == 0x0005`), and the board's exact successor-storage profile:
+  is deliberately insufficient because several boards share the same USB VID/UF2 PID. The deployed v1
+  updater scans the complete region, so keeping this 44-byte layout unchanged lets eligible internal/QSPI
+  update paths accept the canonical final-offset envelope for a one-way bootstrap. MeshTower SD does not
+  use a raw-sector legacy handoff and must be provisioned locally with a BLM2/preview.13-or-newer bootloader
+  before remote SD updates are enabled.
+- The complete 76-byte envelope is fixed at raw-image offset `0x9FB4`, the final 76 bytes of the 40 KiB
+  bootloader region. A valid envelope at any other offset is rejected. The 32-byte `BLM2`/`SOFT`
+  extension must immediately follow the legacy header. It records the actual packed
+  bootloader version, SoftDevice family and FWID, application base, and layout ABI. Compatibility flags and
+  reserved bytes must be zero. The legacy whole-image CRC covers this extension, and the signed package
+  `fw_version` must exactly equal its embedded version. That CRC also covers the CF2 configuration, so do
+  not post-process a bootloader HEX/UF2 with a CF2 patcher: rebuild the exact board profile from source,
+  then package the resulting immutable image.
+- The image must contain exactly one structurally valid privileged `MOTABLDR` continuity marker advertising
+  apply ABI 3 or newer, both full and in-place codecs (`codec_mask & 0x0005 == 0x0005`), and `BOOT_UPDATE`.
+  Every aligned marker meeting those rules counts toward ambiguity even if its otherwise-known storage flags
+  do not name the selected profile; malformed or unknown-bit literal-pool decoys do not. The sole marker must
+  use the board's exact successor-storage profile:
   `0x0E` (stage ceiling + QSPI + boot update) for
   XIAO, `0x09` (SD + boot update) for `heltec_mesh_tower_v2_sdcard`, or `0x0A` (stage ceiling + boot update,
-  with the normal internal store) for internal-only boards. The Tower V2 identity may validly advertise
-  either its SD or internal variant; all other identities accept only their listed profile. This prevents
+  with the normal internal store) for internal-only boards. `heltec_mesh_tower_v2` and
+  `heltec_mesh_tower_v2_sdcard` are separate exact selections, not aliases: choosing either one rejects an
+  image carrying the other profile. All other identities accept only their listed profile. This prevents
   installing an older bootloader that could not accept its own signed successor.
+- The two Tower profiles intentionally retain the same physical signed `target_id` and `hw_id`. A device
+  therefore rejects the wrong profile safely at install time, but an on-air catalog cannot distinguish them
+  before fetching the package. Avoid publishing both profiles in the same unattended serve folder.
+- The embedded compatibility tuple must match the selected board inventory. XIAO, Minewsemi MX25LE01, and
+  T1000-E use S140 7.3.0 (`family=140`, `FWID=0x0123`, `app_base=0x27000`); the other listed boards use S140
+  6.1.1 (`family=140`, `FWID=0x00B6`, `app_base=0x26000`). Every current profile requires layout ABI 1.
+  On-device policy permits an eligible internal/QSPI legacy-v1 bootloader to bootstrap once, then requires
+  every candidate's embedded version to be strictly newer than the installed extended version. MeshTower SD
+  requires local BLM2 provisioning first. There is no remote rollback or compatibility-migration override.
+
+The compatibility extension is byte-pinned relative to the start of the legacy BLMF header:
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 44 | 4 | little-endian magic `0x324D4C42` (`BLM2`) |
+| 48 | 4 | little-endian magic `0x54464F53` (`SOFT`) |
+| 52 | 2 | extension version 2 |
+| 54 | 2 | extension size 32 |
+| 56 | 4 | packed OTAFIX bootloader version |
+| 60 | 2 | SoftDevice family |
+| 62 | 2 | SoftDevice FWID |
+| 64 | 4 | application base |
+| 68 | 2 | layout ABI 1 |
+| 70 | 2 | compatibility flags, currently zero |
+| 72 | 4 | reserved, zero |
 
 The supported routing identities are fixed and signed:
 
@@ -98,7 +147,8 @@ The supported routing identities are fixed and signed:
 | `xiao_nrf52840_ble` | `0x28860044` | `0x28860044` | `XIAO_BL_28860044` / `XIAO_DFU` |
 | `xiao_nrf52840_ble_sense` | `0x28860045` | `0x28860045` | `XIAO_BL_28860045` / `XIAO_DFU` |
 | `heltec_mesh_pocket` | `0x239A0071` | `0x059277F4` | `NRF_BL_239A0071_MESH_POCKET_OTA` / `MESH_POCKET_OTA` |
-| `heltec_mesh_tower_v2` (`heltec_mesh_tower_v2_sdcard` alias) | `0x239A0071` | `0x1150F50E` | `NRF_BL_239A0071_TOWER_V2_OTA` / `TOWER_V2_OTA` |
+| `heltec_mesh_tower_v2` (internal profile `0x0A`) | `0x239A0071` | `0x1150F50E` | `NRF_BL_239A0071_TOWER_V2_OTA` / `TOWER_V2_OTA` |
+| `heltec_mesh_tower_v2_sdcard` (SD profile `0x09`) | `0x239A0071` | `0x1150F50E` | `NRF_BL_239A0071_TOWER_V2_OTA` / `TOWER_V2_OTA` |
 | `heltec_t096` | `0x239A0071` | `0x42354C85` | `NRF_BL_239A0071_T096_DFU` / `T096_DFU` |
 | `heltec_t1` | `0x239A0071` | `0xFC556FFC` | `NRF_BL_239A0071_T1_DFU` / `T1_DFU` |
 | `heltec_t114` | `0x239A0071` | `0x0C3F2902` | `NRF_BL_239A0071_T114_DFU` / `T114_DFU` |
@@ -120,9 +170,10 @@ their original routing IDs for compatibility. The collision snapshot explicitly 
 application targets in `tools/mota/nrf52_internal_bootloader_targets.txt`; update both lists together when
 qualifying another internal-flash target.
 
-`verify` repeats every package, signature, vector, capability-marker, embedded-manifest, board, geometry,
-and CRC gate. `inspect` labels the package as `bootloader` and prints both the embedded board manifest and
-the `MOTABLDR` capability values.
+`verify` repeats every package, signature, vector, capability-marker, embedded-manifest, version,
+SoftDevice/layout, exact-profile, geometry, and CRC gate. `inspect` labels the package as `bootloader` and
+prints the physical board, exact storage profile, legacy manifest, compatibility extension, and `MOTABLDR`
+capability values.
 
 ## Serve
 

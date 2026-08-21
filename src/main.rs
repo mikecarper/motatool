@@ -3,8 +3,8 @@
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use motatool::bootloader::{
-    parse_bootloader_capabilities, parse_bootloader_update_manifest, validate_bootloader_package,
-    BootloaderBoard, BootloaderBuildOpts,
+    bootloader_version_str, parse_bootloader_capabilities, parse_bootloader_update_manifest,
+    validate_bootloader_package, BootloaderBoard, BootloaderBuildOpts, BOOTLOADER_SD_STORAGE,
 };
 use motatool::crypto::{ed25519_keygen, load_key32};
 use motatool::endf::{pack_version, target_id_for_env, version_str};
@@ -34,8 +34,10 @@ enum CliBootloaderBoard {
     XiaoNrf52840Ble,
     #[value(name = "xiao_nrf52840_ble_sense", alias = "xiao-nrf52840-ble-sense")]
     XiaoNrf52840BleSense,
-    #[value(name = "heltec_mesh_tower_v2", alias = "heltec_mesh_tower_v2_sdcard")]
+    #[value(name = "heltec_mesh_tower_v2")]
     HeltecMeshTowerV2,
+    #[value(name = "heltec_mesh_tower_v2_sdcard")]
+    HeltecMeshTowerV2Sdcard,
     #[value(name = "heltec_mesh_pocket")]
     HeltecMeshPocket,
     #[value(name = "heltec_t096")]
@@ -68,6 +70,7 @@ impl From<CliBootloaderBoard> for BootloaderBoard {
             CliBootloaderBoard::XiaoNrf52840Ble => BootloaderBoard::XiaoNrf52840Ble,
             CliBootloaderBoard::XiaoNrf52840BleSense => BootloaderBoard::XiaoNrf52840BleSense,
             CliBootloaderBoard::HeltecMeshTowerV2 => BootloaderBoard::HeltecMeshTowerV2,
+            CliBootloaderBoard::HeltecMeshTowerV2Sdcard => BootloaderBoard::HeltecMeshTowerV2,
             CliBootloaderBoard::HeltecMeshPocket => BootloaderBoard::HeltecMeshPocket,
             CliBootloaderBoard::HeltecT096 => BootloaderBoard::HeltecT096,
             CliBootloaderBoard::HeltecT1 => BootloaderBoard::HeltecT1,
@@ -80,6 +83,15 @@ impl From<CliBootloaderBoard> for BootloaderBoard {
             CliBootloaderBoard::WiscoreRak3401 => BootloaderBoard::WiscoreRak3401,
             CliBootloaderBoard::WiscoreRak4631Board => BootloaderBoard::WiscoreRak4631Board,
             CliBootloaderBoard::WismeshTag => BootloaderBoard::WismeshTag,
+        }
+    }
+}
+
+impl CliBootloaderBoard {
+    fn storage_profile(self) -> u8 {
+        match self {
+            Self::HeltecMeshTowerV2Sdcard => BOOTLOADER_SD_STORAGE,
+            _ => BootloaderBoard::from(self).storage_profile(),
         }
     }
 }
@@ -130,9 +142,10 @@ struct BuildBootloaderArgs {
     /// Ed25519 private key (hex or raw 32 bytes, from `keygen`). Mandatory for bootloader packages.
     #[arg(long)]
     sign: String,
-    /// Nonzero package version label, e.g. 1.1.0.
+    /// Optional four-byte version assertion, e.g. 2.4.1.13 (preview 13) or 2.4.1.255 (stable). The package version is always derived from the signed
+    /// bootloader's embedded build metadata; a differing assertion is rejected.
     #[arg(long = "fw-version")]
-    fw_version: String,
+    fw_version: Option<String>,
     /// Output directory; the file is auto-named. Default: current directory.
     #[arg(long = "out-dir", default_value = ".")]
     out_dir: String,
@@ -357,13 +370,24 @@ fn cmd_build(a: BuildArgs) -> Result<()> {
 
 fn cmd_build_bootloader(a: BuildBootloaderArgs) -> Result<()> {
     let board: BootloaderBoard = a.board.into();
+    let storage_profile = a.board.storage_profile();
     let image = read_bootloader_hex(&a.fw)?;
+    let embedded = parse_bootloader_update_manifest(&image)?;
+    if let Some(asserted) = &a.fw_version {
+        let asserted = pack_version(asserted).context("--fw-version")?;
+        if asserted != embedded.bootloader_version {
+            bail!(
+                "--fw-version {} does not match embedded bootloader version {}",
+                bootloader_version_str(asserted),
+                bootloader_version_str(embedded.bootloader_version)
+            );
+        }
+    }
     let sign_seed = load_key32(&a.sign).context("--sign")?;
-    let fw_version = pack_version(&a.fw_version).context("--fw-version")?;
     let built = build_bootloader(&BootloaderBuildOpts {
         image,
         board,
-        fw_version,
+        storage_profile,
         sign_seed,
     })?;
 
@@ -401,9 +425,9 @@ fn cmd_build_bootloader(a: BuildBootloaderArgs) -> Result<()> {
     println!("wrote {out_path}");
     println!(
         "  bootloader  board={}  target={:08X}  v{}  signed",
-        board.name(),
+        board.profile_name(storage_profile).unwrap_or(board.name()),
         manifest.target_id,
-        version_str(manifest.fw_version),
+        bootloader_version_str(manifest.fw_version),
     );
     println!(
         "  region=0x{:08X}..0x{:08X}  image={}B  blocks={}  total={}B",
@@ -412,6 +436,13 @@ fn cmd_build_bootloader(a: BuildBootloaderArgs) -> Result<()> {
         manifest.image_size,
         manifest.block_count,
         built.bytes.len()
+    );
+    println!(
+        "  continuity=S{} FWID=0x{:04X} app_base=0x{:08X} layout_abi={}",
+        embedded.softdevice_family,
+        embedded.softdevice_fwid,
+        embedded.app_base,
+        embedded.layout_abi
     );
     Ok(())
 }
@@ -451,8 +482,8 @@ fn cmd_verify(a: VerifyArgs) -> ExitCode {
                 "OK    {file} : {} target={:08X} [{}] v{} hw={} {} blocks={} size={}",
                 kind_label(m),
                 m.target_id,
-                target_label(m),
-                version_str(m.fw_version),
+                package_target_label(m, &blob),
+                package_version_str(m),
                 if m.hw_id_str().is_empty() {
                     "?".into()
                 } else {
@@ -495,11 +526,11 @@ fn cmd_inspect(a: InspectArgs) -> Result<()> {
     println!(
         "target_id      : 0x{:08x}  ({})",
         m.target_id,
-        target_label(&m)
+        package_target_label(&m, &blob)
     );
     println!(
         "fw_version     : {}  (0x{:08x})",
-        version_str(m.fw_version),
+        package_version_str(&m),
         m.fw_version
     );
     println!("image_size     : {}", m.image_size);
@@ -549,14 +580,31 @@ fn cmd_inspect(a: InspectArgs) -> Result<()> {
             .context("invalid bootloader package contract")?;
         let capabilities = parse_bootloader_capabilities(payload)
             .context("invalid embedded bootloader capability marker")?;
-        let board = BootloaderBoard::from_identity(embedded.board_id, &embedded.device_name)
-            .map(BootloaderBoard::name)
-            .unwrap_or("unsupported");
-        println!("bootloader_board: {board}");
+        let board = BootloaderBoard::from_identity(embedded.board_id, &embedded.device_name);
+        println!(
+            "bootloader_board: {}",
+            board.map(BootloaderBoard::name).unwrap_or("unsupported")
+        );
+        println!(
+            "bootloader_profile: {}",
+            board
+                .and_then(|board| board.profile_name(capabilities.storage_flags))
+                .unwrap_or("unsupported")
+        );
         println!("embedded_offset : 0x{:04x}", embedded.offset);
         println!("embedded_board  : 0x{:08x}", embedded.board_id);
         println!("embedded_device : {}", embedded.device_name_str());
         println!("embedded_crc32  : 0x{:08x}", embedded.crc32);
+        println!(
+            "embedded_version: {}  (0x{:08x})",
+            bootloader_version_str(embedded.bootloader_version),
+            embedded.bootloader_version
+        );
+        println!("softdevice_family: {}", embedded.softdevice_family);
+        println!("softdevice_fwid: 0x{:04x}", embedded.softdevice_fwid);
+        println!("application_base: 0x{:08x}", embedded.app_base);
+        println!("layout_abi      : {}", embedded.layout_abi);
+        println!("compat_flags    : 0x{:04x}", embedded.compat_flags);
         println!("caps_offset     : 0x{:04x}", capabilities.offset);
         println!("caps_apply_abi  : {}", capabilities.apply_abi);
         println!("caps_codec_mask : 0x{:04x}", capabilities.codec_mask);
@@ -606,8 +654,8 @@ fn cmd_serve(a: ServeArgs) -> Result<()> {
             s.path.file_name().unwrap_or_default().to_string_lossy(),
             hex::encode_upper(m.merkle_root),
             m.target_id,
-            target_label(m),
-            version_str(m.fw_version),
+            package_target_label(m, &s.bytes),
+            package_version_str(m),
             if m.is_bootloader() {
                 "bootloader"
             } else {
@@ -714,4 +762,33 @@ fn target_label(m: &Manifest) -> &'static str {
     } else {
         targets::label(m.target_id)
     }
+}
+
+fn package_version_str(m: &Manifest) -> String {
+    if m.is_bootloader() {
+        bootloader_version_str(m.fw_version)
+    } else {
+        version_str(m.fw_version)
+    }
+}
+
+fn package_target_label(m: &Manifest, blob: &[u8]) -> &'static str {
+    if !m.is_bootloader() {
+        return target_label(m);
+    }
+    let Some(payload_end) = m.payload_off().checked_add(m.payload_size as usize) else {
+        return target_label(m);
+    };
+    let Some(payload) = blob.get(m.payload_off()..payload_end) else {
+        return target_label(m);
+    };
+    let Ok(embedded) = parse_bootloader_update_manifest(payload) else {
+        return target_label(m);
+    };
+    let Ok(capabilities) = parse_bootloader_capabilities(payload) else {
+        return target_label(m);
+    };
+    BootloaderBoard::from_identity(embedded.board_id, &embedded.device_name)
+        .and_then(|board| board.profile_name(capabilities.storage_flags))
+        .unwrap_or_else(|| target_label(m))
 }

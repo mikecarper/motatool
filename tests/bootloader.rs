@@ -10,11 +10,12 @@ use motatool::merkle;
 use motatool::{build_bootloader, verify, BootloaderBuildOpts, Manifest};
 use std::process::Command;
 
-const MANIFEST_OFFSET: usize = 0x8000;
+const MANIFEST_OFFSET: usize = UPDATE_MANIFEST_OFFSET;
 const CAPS_OFFSET: usize = 0x0100;
 const FALSE_CAPS_OFFSET: usize = 0x0080;
 const FALSE_MANIFEST_OFFSET: usize = 0x0200;
 const SEED: [u8; 32] = [0x5A; 32];
+const TEST_BOOT_VERSION: u32 = 0x0102_0304;
 
 fn wr_u16(bytes: &mut [u8], offset: usize, value: u16) {
     bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
@@ -76,6 +77,7 @@ fn make_image_with_storage(board: BootloaderBoard, storage_profile: u8) -> Vec<u
     image[MANIFEST_OFFSET + 24..MANIFEST_OFFSET + 40].fill(0);
     let name = board.device_name().as_bytes();
     image[MANIFEST_OFFSET + 24..MANIFEST_OFFSET + 24 + name.len()].copy_from_slice(name);
+    write_compatibility_extension(&mut image, MANIFEST_OFFSET, board, TEST_BOOT_VERSION);
     rewrite_image_crc(&mut image);
     image
 }
@@ -102,6 +104,44 @@ fn write_manifest_header(image: &mut [u8], offset: usize, board: BootloaderBoard
     let name = board.device_name().as_bytes();
     image[offset + 24..offset + 24 + name.len()].copy_from_slice(name);
     wr_u32(image, offset + UPDATE_MANIFEST_CRC_OFFSET, 0);
+    write_compatibility_extension(image, offset, board, TEST_BOOT_VERSION);
+}
+
+fn write_compatibility_extension(
+    image: &mut [u8],
+    manifest_offset: usize,
+    board: BootloaderBoard,
+    version: u32,
+) {
+    let offset = manifest_offset + UPDATE_COMPAT_OFFSET;
+    let compatibility = board.compatibility();
+    wr_u32(image, offset, UPDATE_COMPAT_MAGIC0);
+    wr_u32(image, offset + 4, UPDATE_COMPAT_MAGIC1);
+    wr_u16(image, offset + 8, UPDATE_COMPAT_VERSION);
+    wr_u16(image, offset + 10, UPDATE_COMPAT_SIZE as u16);
+    wr_u32(image, offset + UPDATE_COMPAT_BOOT_VERSION_OFFSET, version);
+    wr_u16(
+        image,
+        offset + UPDATE_COMPAT_SD_FAMILY_OFFSET,
+        compatibility.softdevice_family,
+    );
+    wr_u16(
+        image,
+        offset + UPDATE_COMPAT_SD_FWID_OFFSET,
+        compatibility.softdevice_fwid,
+    );
+    wr_u32(
+        image,
+        offset + UPDATE_COMPAT_APP_BASE_OFFSET,
+        compatibility.app_base,
+    );
+    wr_u16(
+        image,
+        offset + UPDATE_COMPAT_LAYOUT_ABI_OFFSET,
+        compatibility.layout_abi,
+    );
+    wr_u16(image, offset + UPDATE_COMPAT_FLAGS_OFFSET, 0);
+    wr_u32(image, offset + UPDATE_COMPAT_RESERVED_OFFSET, 0);
 }
 
 /// Solve the two coupled CRC fields so both otherwise identical embedded manifests validate against the
@@ -179,7 +219,7 @@ fn opts(image: Vec<u8>, board: BootloaderBoard) -> BootloaderBuildOpts {
     BootloaderBuildOpts {
         image,
         board,
-        fw_version: 0x0102_0300,
+        storage_profile: board.storage_profile(),
         sign_seed: SEED,
     }
 }
@@ -230,16 +270,23 @@ fn signed_exact_board_package_roundtrips() {
         assert_eq!(manifest.payload_size, BOOTLOADER_IMAGE_SIZE as u32);
         assert_eq!(manifest.block_size(), BOOTLOADER_BLOCK_SIZE);
         assert_eq!(manifest.block_count, BOOTLOADER_BLOCK_COUNT);
+        assert_eq!(manifest.fw_version, TEST_BOOT_VERSION);
         assert_eq!(built.bytes.len(), BOOTLOADER_PACKAGE_SIZE);
         assert_eq!(BOOTLOADER_PACKAGE_SIZE, 41_330);
         let payload = &built.bytes
             [manifest.payload_off()..manifest.payload_off() + manifest.payload_size as usize];
         assert_eq!(payload, image);
+        let embedded = validate_bootloader_package(&manifest, payload).unwrap();
+        assert_eq!(embedded.board_id, board.board_id());
+        assert_eq!(embedded.bootloader_version, manifest.fw_version);
         assert_eq!(
-            validate_bootloader_package(&manifest, payload)
-                .unwrap()
-                .board_id,
-            board.board_id()
+            BootloaderCompatibility {
+                softdevice_family: embedded.softdevice_family,
+                softdevice_fwid: embedded.softdevice_fwid,
+                app_base: embedded.app_base,
+                layout_abi: embedded.layout_abi,
+            },
+            board.compatibility()
         );
         assert!(built.suggested_name.contains("_bootloader_"));
     }
@@ -264,11 +311,23 @@ fn mesh_tower_sd_profile_is_exact_and_board_scoped() {
     let capabilities = parse_bootloader_capabilities(&image).unwrap();
     assert_eq!(capabilities.storage_flags, 0x09);
     assert_eq!(
-        validate_bootloader_image(&image, tower).unwrap().board_id,
+        tower.profile_name(BOOTLOADER_SD_STORAGE),
+        Some("heltec_mesh_tower_v2_sdcard")
+    );
+    assert_eq!(
+        tower.profile_name(BOOTLOADER_INTERNAL_STORAGE),
+        Some("heltec_mesh_tower_v2")
+    );
+    assert_eq!(
+        validate_bootloader_image_for_profile(&image, tower, BOOTLOADER_SD_STORAGE)
+            .unwrap()
+            .board_id,
         0x239A_0071
     );
 
-    let built = build_bootloader(&opts(image.clone(), tower)).unwrap();
+    let mut tower_sd_opts = opts(image.clone(), tower);
+    tower_sd_opts.storage_profile = BOOTLOADER_SD_STORAGE;
+    let built = build_bootloader(&tower_sd_opts).unwrap();
     assert!(verify(&built.bytes).is_empty());
     let manifest = Manifest::parse(&built.bytes).unwrap();
     assert_eq!(manifest.target_id, 0x1150_F50E);
@@ -277,15 +336,22 @@ fn mesh_tower_sd_profile_is_exact_and_board_scoped() {
         [manifest.payload_off()..manifest.payload_off() + manifest.payload_size as usize];
     assert_eq!(payload, image);
 
+    let error = validate_bootloader_image(&image, tower)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("does not match selected profile"), "{error}");
+    let error =
+        validate_bootloader_image_for_profile(&make_image(tower), tower, BOOTLOADER_SD_STORAGE)
+            .unwrap_err()
+            .to_string();
+    assert!(error.contains("does not match selected profile"), "{error}");
+
     let rak = BootloaderBoard::WiscoreRak3401;
     let error =
         validate_bootloader_image(&make_image_with_storage(rak, BOOTLOADER_SD_STORAGE), rak)
             .unwrap_err()
             .to_string();
-    assert!(
-        error.contains("is not supported for wiscore_rak3401"),
-        "{error}"
-    );
+    assert!(error.contains("does not match selected profile"), "{error}");
 
     let mut bare_sd = make_image(tower);
     bare_sd[CAPS_OFFSET + 12] = BOOTLOADER_STORAGE_SD;
@@ -294,6 +360,37 @@ fn mesh_tower_sd_profile_is_exact_and_board_scoped() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("structurally valid"), "{error}");
+}
+
+#[test]
+fn softdevice_layout_inventory_is_pinned() {
+    let s140_v7 = BOOTLOADER_BOARDS
+        .into_iter()
+        .filter(|board| board.compatibility().softdevice_fwid == SOFTDEVICE_S140_7_3_0_FWID)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        s140_v7,
+        vec![
+            BootloaderBoard::XiaoNrf52840Ble,
+            BootloaderBoard::XiaoNrf52840BleSense,
+            BootloaderBoard::MinewsemiMx25le01,
+            BootloaderBoard::T1000E,
+        ]
+    );
+    for board in BOOTLOADER_BOARDS {
+        let compatibility = board.compatibility();
+        assert_eq!(compatibility.softdevice_family, SOFTDEVICE_FAMILY_S140);
+        assert_eq!(compatibility.layout_abi, BOOTLOADER_LAYOUT_ABI);
+        match compatibility.softdevice_fwid {
+            SOFTDEVICE_S140_6_1_1_FWID => {
+                assert_eq!(compatibility.app_base, SOFTDEVICE_S140_6_1_1_APP_BASE)
+            }
+            SOFTDEVICE_S140_7_3_0_FWID => {
+                assert_eq!(compatibility.app_base, SOFTDEVICE_S140_7_3_0_APP_BASE)
+            }
+            other => panic!("unexpected FWID 0x{other:04X} for {}", board.name()),
+        }
+    }
 }
 
 #[test]
@@ -421,7 +518,7 @@ fn embedded_crc_and_geometry_are_rejected() {
         .err()
         .unwrap()
         .to_string();
-    assert!(error.contains("bootloader update manifest"), "{error}");
+    assert!(error.contains("unsupported exact identity"), "{error}");
 
     let mut noncanonical_padding = make_image(BootloaderBoard::WiscoreRak3401);
     noncanonical_padding[MANIFEST_OFFSET + 24 + "3401_DFU".len() + 1] = b'X';
@@ -443,6 +540,74 @@ fn embedded_crc_and_geometry_are_rejected() {
 }
 
 #[test]
+fn compatibility_extension_is_required_crc_bound_and_inventory_checked() {
+    let board = BootloaderBoard::XiaoNrf52840Ble;
+
+    let mut legacy_only = make_image(board);
+    legacy_only
+        [MANIFEST_OFFSET + UPDATE_COMPAT_OFFSET..MANIFEST_OFFSET + UPDATE_MANIFEST_ENVELOPE_SIZE]
+        .fill(0xFF);
+    rewrite_image_crc(&mut legacy_only);
+    let error = parse_bootloader_update_manifest(&legacy_only)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("missing adjacent BLM2/SOFT"), "{error}");
+
+    let mut corrupt_extension = make_image(board);
+    corrupt_extension[MANIFEST_OFFSET + UPDATE_COMPAT_OFFSET + UPDATE_COMPAT_SD_FWID_OFFSET] ^= 1;
+    let error = parse_bootloader_update_manifest(&corrupt_extension)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("CRC32 mismatch"), "{error}");
+
+    for (field_offset, value, label) in [
+        (UPDATE_COMPAT_SD_FAMILY_OFFSET, 132u16, "SoftDevice family"),
+        (
+            UPDATE_COMPAT_SD_FWID_OFFSET,
+            SOFTDEVICE_S140_6_1_1_FWID,
+            "SoftDevice FWID",
+        ),
+        (UPDATE_COMPAT_LAYOUT_ABI_OFFSET, 2u16, "layout ABI"),
+    ] {
+        let mut image = make_image(board);
+        wr_u16(
+            &mut image,
+            MANIFEST_OFFSET + UPDATE_COMPAT_OFFSET + field_offset,
+            value,
+        );
+        rewrite_image_crc(&mut image);
+        let error = build_bootloader(&opts(image, board))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("does not match"), "{label}: {error}");
+    }
+
+    let mut wrong_app_base = make_image(board);
+    wr_u32(
+        &mut wrong_app_base,
+        MANIFEST_OFFSET + UPDATE_COMPAT_OFFSET + UPDATE_COMPAT_APP_BASE_OFFSET,
+        SOFTDEVICE_S140_6_1_1_APP_BASE,
+    );
+    rewrite_image_crc(&mut wrong_app_base);
+    let error = build_bootloader(&opts(wrong_app_base, board))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("does not match"), "{error}");
+
+    for field_offset in [UPDATE_COMPAT_FLAGS_OFFSET, UPDATE_COMPAT_RESERVED_OFFSET] {
+        let mut image = make_image(board);
+        image[MANIFEST_OFFSET + UPDATE_COMPAT_OFFSET + field_offset] = 1;
+        rewrite_image_crc(&mut image);
+        let error = parse_bootloader_update_manifest(&image)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("flags/reserved"), "{error}");
+    }
+}
+
+#[test]
 fn invalid_manifest_candidate_does_not_shadow_later_valid_manifest() {
     let board = BootloaderBoard::XiaoNrf52840Ble;
     let mut image = make_image(board);
@@ -453,6 +618,29 @@ fn invalid_manifest_candidate_does_not_shadow_later_valid_manifest() {
         BOOTLOADER_IMAGE_SIZE as u32 - 4,
     );
     rewrite_image_crc(&mut image);
+
+    let parsed = parse_bootloader_update_manifest(&image).unwrap();
+    assert_eq!(parsed.offset, MANIFEST_OFFSET);
+}
+
+#[test]
+fn crc_invalid_legacy_decoy_does_not_shadow_unique_canonical_blm2() {
+    let board = BootloaderBoard::XiaoNrf52840Ble;
+    let mut image = make_image(board);
+    write_manifest_header(&mut image, FALSE_MANIFEST_OFFSET, board);
+    image[FALSE_MANIFEST_OFFSET + UPDATE_COMPAT_OFFSET
+        ..FALSE_MANIFEST_OFFSET + UPDATE_MANIFEST_ENVELOPE_SIZE]
+        .fill(0xFF);
+    wr_u32(
+        &mut image,
+        FALSE_MANIFEST_OFFSET + UPDATE_MANIFEST_CRC_OFFSET,
+        0,
+    );
+    rewrite_image_crc(&mut image);
+    assert_ne!(
+        rd_u32(&image, FALSE_MANIFEST_OFFSET + UPDATE_MANIFEST_CRC_OFFSET),
+        bootloader_image_crc32(&image, FALSE_MANIFEST_OFFSET + UPDATE_MANIFEST_CRC_OFFSET)
+    );
 
     let parsed = parse_bootloader_update_manifest(&image).unwrap();
     assert_eq!(parsed.offset, MANIFEST_OFFSET);
@@ -470,6 +658,82 @@ fn duplicate_fully_valid_manifests_are_rejected() {
         .unwrap()
         .to_string();
     assert!(error.contains("found 2"), "{error}");
+}
+
+#[test]
+fn duplicate_crc_valid_unknown_identity_is_still_ambiguous() {
+    let board = BootloaderBoard::XiaoNrf52840Ble;
+    let mut image = make_image(board);
+    write_manifest_header(&mut image, FALSE_MANIFEST_OFFSET, board);
+    // A package producer must count every structurally and CRC-valid envelope,
+    // even when one identity is outside its inventory. MeshCore's portable
+    // scanner does the same, so a host-accepted package cannot fail only after
+    // an on-device duplicate-identity scan.
+    wr_u32(&mut image, FALSE_MANIFEST_OFFSET + 20, 0x1234_5678);
+    make_both_manifest_crcs_valid(&mut image, FALSE_MANIFEST_OFFSET, MANIFEST_OFFSET);
+
+    let error = parse_bootloader_update_manifest(&image)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("found 2"), "{error}");
+}
+
+#[test]
+fn crc_valid_legacy_decoy_and_canonical_blm2_are_ambiguous() {
+    let board = BootloaderBoard::XiaoNrf52840Ble;
+    let mut image = make_image(board);
+    write_manifest_header(&mut image, FALSE_MANIFEST_OFFSET, board);
+    image[FALSE_MANIFEST_OFFSET + UPDATE_COMPAT_OFFSET
+        ..FALSE_MANIFEST_OFFSET + UPDATE_MANIFEST_ENVELOPE_SIZE]
+        .fill(0xFF);
+    make_both_manifest_crcs_valid(&mut image, FALSE_MANIFEST_OFFSET, MANIFEST_OFFSET);
+
+    let error = parse_bootloader_update_manifest(&image)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("found 2"), "{error}");
+}
+
+#[test]
+fn crc_valid_corrupt_extension_decoy_still_counts_as_legacy_identity() {
+    let board = BootloaderBoard::XiaoNrf52840Ble;
+    let mut image = make_image(board);
+    write_manifest_header(&mut image, FALSE_MANIFEST_OFFSET, board);
+    wr_u32(
+        &mut image,
+        FALSE_MANIFEST_OFFSET + UPDATE_COMPAT_OFFSET + 4,
+        0,
+    );
+    make_both_manifest_crcs_valid(&mut image, FALSE_MANIFEST_OFFSET, MANIFEST_OFFSET);
+
+    let error = parse_bootloader_update_manifest(&image)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("found 2"), "{error}");
+}
+
+#[test]
+fn valid_envelope_at_a_noncanonical_offset_is_rejected() {
+    let board = BootloaderBoard::WiscoreRak3401;
+    let mut image = make_image(board);
+    const WRONG_OFFSET: usize = 0x8000;
+    let envelope: [u8; UPDATE_MANIFEST_ENVELOPE_SIZE] = image
+        [MANIFEST_OFFSET..MANIFEST_OFFSET + UPDATE_MANIFEST_ENVELOPE_SIZE]
+        .try_into()
+        .unwrap();
+    image[WRONG_OFFSET..WRONG_OFFSET + UPDATE_MANIFEST_ENVELOPE_SIZE].copy_from_slice(&envelope);
+    image[MANIFEST_OFFSET..MANIFEST_OFFSET + UPDATE_MANIFEST_ENVELOPE_SIZE].fill(0xFF);
+    let crc_offset = WRONG_OFFSET + UPDATE_MANIFEST_CRC_OFFSET;
+    wr_u32(&mut image, crc_offset, 0);
+    let crc = bootloader_image_crc32(&image, crc_offset);
+    wr_u32(&mut image, crc_offset, crc);
+
+    let error = parse_bootloader_update_manifest(&image)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("final 76 bytes"), "{error}");
+    assert!(error.contains("0x9FB4"), "{error}");
+    assert!(error.contains("0x8000"), "{error}");
 }
 
 #[test]
@@ -528,6 +792,18 @@ fn unsigned_and_noncanonical_packages_are_rejected_by_verify() {
     let problems = verify(&zero_version);
     assert!(
         problems.iter().any(|problem| problem.contains("nonzero")),
+        "{problems:?}"
+    );
+
+    let mut mislabeled_version = built.bytes.clone();
+    mislabeled_version[HEADER_LEN + off::FW_VERSION..HEADER_LEN + off::FW_VERSION + 4]
+        .copy_from_slice(&(TEST_BOOT_VERSION + 0x100).to_le_bytes());
+    resign(&mut mislabeled_version);
+    let problems = verify(&mislabeled_version);
+    assert!(
+        problems
+            .iter()
+            .any(|problem| problem.contains("does not match embedded bootloader version")),
         "{problems:?}"
     );
 
@@ -604,6 +880,13 @@ fn vectors_and_successor_capability_are_required() {
         .to_string();
     assert!(error.contains("finite apply_abi"), "{error}");
 
+    let mut future_abi = make_image(board);
+    wr_u16(&mut future_abi, CAPS_OFFSET + 8, 0x0100);
+    rewrite_image_crc(&mut future_abi);
+    let capabilities = parse_bootloader_capabilities(&future_abi).unwrap();
+    assert_eq!(capabilities.apply_abi, 0x0100);
+    build_bootloader(&opts(future_abi, board)).unwrap();
+
     let mut no_full_codec = make_image(board);
     wr_u16(&mut no_full_codec, CAPS_OFFSET + 10, 1 << 2);
     rewrite_image_crc(&mut no_full_codec);
@@ -652,10 +935,7 @@ fn vectors_and_successor_capability_are_required() {
         .err()
         .unwrap()
         .to_string();
-    assert!(
-        error.contains("is not supported for wiscore_rak3401"),
-        "{error}"
-    );
+    assert!(error.contains("does not match selected profile"), "{error}");
 
     let mut nonzero_reserved = make_image(board);
     nonzero_reserved[CAPS_OFFSET + 13] = 1;
@@ -694,10 +974,65 @@ fn vectors_and_successor_capability_are_required() {
         .to_string();
     assert!(error.contains("found 2"), "{error}");
 
-    let mut zero_version = opts(make_image(board), board);
-    zero_version.fw_version = 0;
-    let error = build_bootloader(&zero_version).err().unwrap().to_string();
-    assert!(error.contains("fw_version must be nonzero"), "{error}");
+    let mut nonselected_privileged_caps = make_image(board);
+    let marker: [u8; BOOTLOADER_CAPS_SIZE] = nonselected_privileged_caps
+        [CAPS_OFFSET..CAPS_OFFSET + BOOTLOADER_CAPS_SIZE]
+        .try_into()
+        .unwrap();
+    nonselected_privileged_caps[CAPS_OFFSET + 0x80..CAPS_OFFSET + 0x80 + BOOTLOADER_CAPS_SIZE]
+        .copy_from_slice(&marker);
+    nonselected_privileged_caps[CAPS_OFFSET + 0x80 + 12] = BOOTLOADER_STORAGE_BOOT_UPDATE;
+    rewrite_image_crc(&mut nonselected_privileged_caps);
+    let error = build_bootloader(&opts(nonselected_privileged_caps, board))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("found 2"), "{error}");
+
+    let mut malformed_caps_decoy = make_image(board);
+    let marker: [u8; BOOTLOADER_CAPS_SIZE] = malformed_caps_decoy
+        [CAPS_OFFSET..CAPS_OFFSET + BOOTLOADER_CAPS_SIZE]
+        .try_into()
+        .unwrap();
+    malformed_caps_decoy[CAPS_OFFSET + 0x80..CAPS_OFFSET + 0x80 + BOOTLOADER_CAPS_SIZE]
+        .copy_from_slice(&marker);
+    malformed_caps_decoy[CAPS_OFFSET + 0x80 + 12] = BOOTLOADER_STORAGE_BOOT_UPDATE | 0x80;
+    rewrite_image_crc(&mut malformed_caps_decoy);
+    let capabilities = parse_bootloader_capabilities(&malformed_caps_decoy).unwrap();
+    assert_eq!(capabilities.offset, CAPS_OFFSET);
+    assert_eq!(capabilities.storage_flags, board.storage_profile());
+
+    let mut zero_version_image = make_image(board);
+    wr_u32(
+        &mut zero_version_image,
+        MANIFEST_OFFSET + UPDATE_COMPAT_OFFSET + UPDATE_COMPAT_BOOT_VERSION_OFFSET,
+        0,
+    );
+    rewrite_image_crc(&mut zero_version_image);
+    let error = build_bootloader(&opts(zero_version_image, board))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        error.contains("invalid embedded bootloader version"),
+        "{error}"
+    );
+
+    let mut preview_zero_image = make_image(board);
+    wr_u32(
+        &mut preview_zero_image,
+        MANIFEST_OFFSET + UPDATE_COMPAT_OFFSET + UPDATE_COMPAT_BOOT_VERSION_OFFSET,
+        0x0204_0100,
+    );
+    rewrite_image_crc(&mut preview_zero_image);
+    let error = build_bootloader(&opts(preview_zero_image, board))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        error.contains("invalid embedded bootloader version"),
+        "{error}"
+    );
 
     // Verification repeats the vector gate even for an otherwise self-consistent, freshly signed package.
     let mut bad_vector_package = build_bootloader(&opts(make_image(board), board))
@@ -718,6 +1053,8 @@ fn vectors_and_successor_capability_are_required() {
 #[test]
 fn crc_matches_standard_ieee_vector() {
     assert_eq!(bootloader_image_crc32(b"123456789", 9), 0xCBF4_3926);
+    assert_eq!(bootloader_version_str(0x0204_010C), "2.4.1-preview.12");
+    assert_eq!(bootloader_version_str(0x0204_01FF), "2.4.1");
 }
 
 #[test]
@@ -739,11 +1076,35 @@ fn cli_builds_from_hex_and_labels_bootloader_packages() {
             "--board",
             board.name(),
             "--fw-version",
-            "1.2.3",
+            "1.2.3.4",
         ])
         .output()
         .unwrap();
     assert!(!missing_key.status.success(), "--sign must be required");
+
+    let wrong_version = Command::new(env!("CARGO_BIN_EXE_motatool"))
+        .args([
+            "build-bootloader",
+            "--fw",
+            hex_path.to_str().unwrap(),
+            "--board",
+            board.name(),
+            "--sign",
+            key_path.to_str().unwrap(),
+            "--fw-version",
+            "1.2.3.5",
+            "--out",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!wrong_version.status.success());
+    assert!(
+        String::from_utf8_lossy(&wrong_version.stderr)
+            .contains("does not match embedded bootloader version"),
+        "{}",
+        String::from_utf8_lossy(&wrong_version.stderr)
+    );
 
     let output = Command::new(env!("CARGO_BIN_EXE_motatool"))
         .args([
@@ -755,7 +1116,7 @@ fn cli_builds_from_hex_and_labels_bootloader_packages() {
             "--sign",
             key_path.to_str().unwrap(),
             "--fw-version",
-            "1.2.3",
+            "1.2.3.4",
             "--out",
             out_path.to_str().unwrap(),
         ])
@@ -793,6 +1154,14 @@ fn cli_builds_from_hex_and_labels_bootloader_packages() {
     assert!(stdout.contains("BOOTLOADER=true"), "{stdout}");
     assert!(stdout.contains("xiao_nrf52840_ble"), "{stdout}");
     assert!(stdout.contains("caps_apply_abi  : 3"), "{stdout}");
+    assert!(
+        stdout.contains("embedded_version: 1.2.3-preview.4"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("softdevice_family: 140"), "{stdout}");
+    assert!(stdout.contains("softdevice_fwid: 0x0123"), "{stdout}");
+    assert!(stdout.contains("application_base: 0x00027000"), "{stdout}");
+    assert!(stdout.contains("layout_abi      : 1"), "{stdout}");
 
     let rak = BootloaderBoard::WiscoreRak3401;
     let rak_hex = dir.path().join("rak3401_bootloader.hex");
@@ -807,8 +1176,6 @@ fn cli_builds_from_hex_and_labels_bootloader_packages() {
             rak.name(),
             "--sign",
             key_path.to_str().unwrap(),
-            "--fw-version",
-            "1.2.3",
             "--out",
             rak_out.to_str().unwrap(),
         ])
@@ -842,6 +1209,53 @@ fn cli_builds_from_hex_and_labels_bootloader_packages() {
     let tower_hex = dir.path().join("tower_v2_sd_bootloader.hex");
     let tower_out = dir.path().join("tower_v2_sd.mota");
     std::fs::write(&tower_hex, image_as_intel_hex(&tower_image)).unwrap();
+
+    let wrong_tower_profile = Command::new(env!("CARGO_BIN_EXE_motatool"))
+        .args([
+            "build-bootloader",
+            "--fw",
+            tower_hex.to_str().unwrap(),
+            "--board",
+            "heltec_mesh_tower_v2",
+            "--sign",
+            key_path.to_str().unwrap(),
+            "--out",
+            tower_out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!wrong_tower_profile.status.success());
+    assert!(
+        String::from_utf8_lossy(&wrong_tower_profile.stderr)
+            .contains("does not match selected profile"),
+        "{}",
+        String::from_utf8_lossy(&wrong_tower_profile.stderr)
+    );
+
+    let tower_internal_hex = dir.path().join("tower_v2_internal_bootloader.hex");
+    std::fs::write(&tower_internal_hex, image_as_intel_hex(&make_image(tower))).unwrap();
+    let wrong_sd_profile = Command::new(env!("CARGO_BIN_EXE_motatool"))
+        .args([
+            "build-bootloader",
+            "--fw",
+            tower_internal_hex.to_str().unwrap(),
+            "--board",
+            "heltec_mesh_tower_v2_sdcard",
+            "--sign",
+            key_path.to_str().unwrap(),
+            "--out",
+            tower_out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!wrong_sd_profile.status.success());
+    assert!(
+        String::from_utf8_lossy(&wrong_sd_profile.stderr)
+            .contains("does not match selected profile"),
+        "{}",
+        String::from_utf8_lossy(&wrong_sd_profile.stderr)
+    );
+
     let output = Command::new(env!("CARGO_BIN_EXE_motatool"))
         .args([
             "build-bootloader",
@@ -852,7 +1266,7 @@ fn cli_builds_from_hex_and_labels_bootloader_packages() {
             "--sign",
             key_path.to_str().unwrap(),
             "--fw-version",
-            "1.2.3",
+            "1.2.3.4",
             "--out",
             tower_out.to_str().unwrap(),
         ])
@@ -868,6 +1282,21 @@ fn cli_builds_from_hex_and_labels_bootloader_packages() {
     let manifest = Manifest::parse(&blob).unwrap();
     assert_eq!(manifest.target_id, 0x1150_F50E);
     assert_eq!(manifest.hw_id_str(), "NRF_BL_239A0071_TOWER_V2_OTA");
+    let verify_output = Command::new(env!("CARGO_BIN_EXE_motatool"))
+        .args(["verify", tower_out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(verify_output.status.success());
+    assert!(
+        String::from_utf8_lossy(&verify_output.stdout).contains("[heltec_mesh_tower_v2_sdcard]"),
+        "{}",
+        String::from_utf8_lossy(&verify_output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&verify_output.stdout).contains("v1.2.3-preview.4"),
+        "{}",
+        String::from_utf8_lossy(&verify_output.stdout)
+    );
     let inspect = Command::new(env!("CARGO_BIN_EXE_motatool"))
         .args(["inspect", tower_out.to_str().unwrap()])
         .output()
@@ -876,6 +1305,10 @@ fn cli_builds_from_hex_and_labels_bootloader_packages() {
     let stdout = String::from_utf8_lossy(&inspect.stdout);
     assert!(
         stdout.contains("bootloader_board: heltec_mesh_tower_v2"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("bootloader_profile: heltec_mesh_tower_v2_sdcard"),
         "{stdout}"
     );
     assert!(stdout.contains("caps_storage    : 0x09"), "{stdout}");
