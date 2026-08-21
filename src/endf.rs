@@ -95,9 +95,9 @@ pub fn parse_nrf52_layout(image: &[u8]) -> Option<Nrf52Layout> {
         || layout.app_base >= layout.linked_app_end
         || layout.linked_app_end > NRF52_APP_END
         || (scratch_layout
-            && (!layout.qspi_backed()
-                || layout.linked_app_end != NRF52_QSPI_LINKED_APP_END
-                || layout.stage_ceiling != NRF52_APP_END))
+            && !(layout.qspi_backed()
+                && layout.linked_app_end == NRF52_QSPI_LINKED_APP_END
+                && layout.stage_ceiling == NRF52_APP_END))
         || (!scratch_layout && layout.linked_app_end == NRF52_QSPI_LINKED_APP_END)
     {
         return None;

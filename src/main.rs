@@ -34,6 +34,32 @@ enum CliBootloaderBoard {
     XiaoNrf52840Ble,
     #[value(name = "xiao_nrf52840_ble_sense", alias = "xiao-nrf52840-ble-sense")]
     XiaoNrf52840BleSense,
+    #[value(name = "heltec_mesh_tower_v2")]
+    HeltecMeshTowerV2,
+    #[value(name = "heltec_mesh_pocket")]
+    HeltecMeshPocket,
+    #[value(name = "heltec_t096")]
+    HeltecT096,
+    #[value(name = "heltec_t1")]
+    HeltecT1,
+    #[value(name = "heltec_t114")]
+    HeltecT114,
+    #[value(name = "keepteen_lt1")]
+    KeepteenLt1,
+    #[value(name = "minewsemi_mx25le01")]
+    MinewsemiMx25le01,
+    #[value(name = "promicro_nrf52840")]
+    PromicroNrf52840,
+    #[value(name = "t1000_e")]
+    T1000E,
+    #[value(name = "thinknode_m3")]
+    ThinknodeM3,
+    #[value(name = "wiscore_rak3401")]
+    WiscoreRak3401,
+    #[value(name = "wiscore_rak4631_board")]
+    WiscoreRak4631Board,
+    #[value(name = "wismesh_tag")]
+    WismeshTag,
 }
 
 impl From<CliBootloaderBoard> for BootloaderBoard {
@@ -41,6 +67,19 @@ impl From<CliBootloaderBoard> for BootloaderBoard {
         match board {
             CliBootloaderBoard::XiaoNrf52840Ble => BootloaderBoard::XiaoNrf52840Ble,
             CliBootloaderBoard::XiaoNrf52840BleSense => BootloaderBoard::XiaoNrf52840BleSense,
+            CliBootloaderBoard::HeltecMeshTowerV2 => BootloaderBoard::HeltecMeshTowerV2,
+            CliBootloaderBoard::HeltecMeshPocket => BootloaderBoard::HeltecMeshPocket,
+            CliBootloaderBoard::HeltecT096 => BootloaderBoard::HeltecT096,
+            CliBootloaderBoard::HeltecT1 => BootloaderBoard::HeltecT1,
+            CliBootloaderBoard::HeltecT114 => BootloaderBoard::HeltecT114,
+            CliBootloaderBoard::KeepteenLt1 => BootloaderBoard::KeepteenLt1,
+            CliBootloaderBoard::MinewsemiMx25le01 => BootloaderBoard::MinewsemiMx25le01,
+            CliBootloaderBoard::PromicroNrf52840 => BootloaderBoard::PromicroNrf52840,
+            CliBootloaderBoard::T1000E => BootloaderBoard::T1000E,
+            CliBootloaderBoard::ThinknodeM3 => BootloaderBoard::ThinknodeM3,
+            CliBootloaderBoard::WiscoreRak3401 => BootloaderBoard::WiscoreRak3401,
+            CliBootloaderBoard::WiscoreRak4631Board => BootloaderBoard::WiscoreRak4631Board,
+            CliBootloaderBoard::WismeshTag => BootloaderBoard::WismeshTag,
         }
     }
 }
@@ -68,7 +107,7 @@ struct Cli {
 enum Command {
     /// Package a firmware as a full or delta .mota.
     Build(BuildArgs),
-    /// Package a board-bound OTAFIX XIAO bootloader Intel HEX as a signed v3 .mota.
+    /// Package a board-bound OTAFIX nRF52840 bootloader Intel HEX as a signed v3 .mota.
     BuildBootloader(BuildBootloaderArgs),
     /// Validate .mota files (block hashes, merkle root, full-image hash, optional signature).
     Verify(VerifyArgs),
@@ -85,7 +124,7 @@ struct BuildBootloaderArgs {
     /// OTAFIX bootloader Intel HEX; only 0xF4000..0xFE000 is extracted and gaps become 0xFF.
     #[arg(long)]
     fw: String,
-    /// Exact XIAO variant; it must match the embedded bootloader update manifest.
+    /// Exact OTAFIX board variant; it must match the complete embedded board ID and DEVICE_NAME.
     #[arg(long, value_enum)]
     board: CliBootloaderBoard,
     /// Ed25519 private key (hex or raw 32 bytes, from `keygen`). Mandatory for bootloader packages.
@@ -510,7 +549,7 @@ fn cmd_inspect(a: InspectArgs) -> Result<()> {
             .context("invalid bootloader package contract")?;
         let capabilities = parse_bootloader_capabilities(payload)
             .context("invalid embedded bootloader capability marker")?;
-        let board = BootloaderBoard::from_board_id(embedded.board_id)
+        let board = BootloaderBoard::from_identity(embedded.board_id, &embedded.device_name)
             .map(BootloaderBoard::name)
             .unwrap_or("unsupported");
         println!("bootloader_board: {board}");
@@ -522,6 +561,14 @@ fn cmd_inspect(a: InspectArgs) -> Result<()> {
         println!("caps_apply_abi  : {}", capabilities.apply_abi);
         println!("caps_codec_mask : 0x{:04x}", capabilities.codec_mask);
         println!("caps_storage    : 0x{:02x}", capabilities.storage_flags);
+        println!(
+            "caps_stage_kind : {}",
+            if capabilities.storage_flags == motatool::bootloader::BOOTLOADER_INTERNAL_STORAGE {
+                "internal"
+            } else {
+                "qspi"
+            }
+        );
     }
     Ok(())
 }
@@ -660,7 +707,7 @@ fn kind_label(m: &Manifest) -> &'static str {
 
 fn target_label(m: &Manifest) -> &'static str {
     if m.is_bootloader() {
-        BootloaderBoard::from_board_id(m.target_id)
+        BootloaderBoard::from_target_id(m.target_id)
             .map(BootloaderBoard::name)
             .unwrap_or("unsupported bootloader board")
     } else {

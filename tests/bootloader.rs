@@ -4,7 +4,7 @@ use motatool::bootloader::*;
 use motatool::crypto::{ed25519_public_from_seed, ed25519_sign, sha256};
 use motatool::format::{
     off, rd_u32, BOOTLOADER_FORMAT_VER, HEADER_LEN, HW_ID_LEN, MFLAG_BOOTLOADER, MFLAG_FULL,
-    MFLAG_SIGNED, SIGNED_LEN,
+    MFLAG_SIGNED, NRF52_APP_END, NRF52_FLASH_PAGE, SIGNED_LEN,
 };
 use motatool::merkle;
 use motatool::{build_bootloader, verify, BootloaderBuildOpts, Manifest};
@@ -37,7 +37,7 @@ fn make_image(board: BootloaderBoard) -> Vec<u8> {
     image[CAPS_OFFSET..CAPS_OFFSET + 8].copy_from_slice(&BOOTLOADER_CAPS_MAGIC);
     wr_u16(&mut image, CAPS_OFFSET + 8, BOOTLOADER_MIN_APPLY_ABI);
     wr_u16(&mut image, CAPS_OFFSET + 10, 0x0005); // full + in-place codecs
-    image[CAPS_OFFSET + 12] = BOOTLOADER_REQUIRED_STORAGE;
+    image[CAPS_OFFSET + 12] = board.storage_profile();
     image[CAPS_OFFSET + 13..CAPS_OFFSET + 16].fill(0);
 
     // Likewise, a bare magic pair is not a complete embedded update manifest.
@@ -210,10 +210,8 @@ fn refresh_payload_integrity(blob: &mut [u8]) {
 
 #[test]
 fn signed_exact_board_package_roundtrips() {
-    for board in [
-        BootloaderBoard::XiaoNrf52840Ble,
-        BootloaderBoard::XiaoNrf52840BleSense,
-    ] {
+    validate_bootloader_inventory().unwrap();
+    for board in BOOTLOADER_BOARDS {
         let image = make_image(board);
         let built = build_bootloader(&opts(image.clone(), board)).unwrap();
         assert!(verify(&built.bytes).is_empty());
@@ -222,12 +220,14 @@ fn signed_exact_board_package_roundtrips() {
         assert_eq!(manifest.format_ver, BOOTLOADER_FORMAT_VER);
         assert_eq!(manifest.flags, MFLAG_FULL | MFLAG_SIGNED | MFLAG_BOOTLOADER);
         assert!(manifest.is_full() && manifest.is_signed() && manifest.is_bootloader());
-        assert_eq!(manifest.target_id, board.board_id());
+        assert_eq!(manifest.target_id, board.target_id());
         assert_eq!(manifest.hw_id_str(), board.hw_id());
         assert_eq!(manifest.image_size, BOOTLOADER_IMAGE_SIZE as u32);
         assert_eq!(manifest.payload_size, BOOTLOADER_IMAGE_SIZE as u32);
         assert_eq!(manifest.block_size(), BOOTLOADER_BLOCK_SIZE);
         assert_eq!(manifest.block_count, BOOTLOADER_BLOCK_COUNT);
+        assert_eq!(built.bytes.len(), BOOTLOADER_PACKAGE_SIZE);
+        assert_eq!(BOOTLOADER_PACKAGE_SIZE, 41_330);
         let payload = &built.bytes
             [manifest.payload_off()..manifest.payload_off() + manifest.payload_size as usize];
         assert_eq!(payload, image);
@@ -238,6 +238,85 @@ fn signed_exact_board_package_roundtrips() {
             board.board_id()
         );
         assert!(built.suggested_name.contains("_bootloader_"));
+    }
+}
+
+#[test]
+fn shared_internal_boot_package_geometry_is_pinned() {
+    let stage_start = (NRF52_APP_END - BOOTLOADER_PACKAGE_SIZE as u32) & !(NRF52_FLASH_PAGE - 1);
+    assert_eq!(stage_start, 0x000E_2000);
+    assert_eq!(stage_start + BOOTLOADER_IMAGE_SIZE as u32, 0x000E_C000);
+    assert!(stage_start + BOOTLOADER_PACKAGE_SIZE as u32 <= NRF52_APP_END);
+    assert!(BOOTLOADER_BOARDS
+        .into_iter()
+        .filter(|board| board.storage_profile() == BOOTLOADER_INTERNAL_STORAGE)
+        .all(|board| board.storage_profile() == 0x0A));
+}
+
+#[test]
+fn shared_vid_pid_identities_route_without_collisions() {
+    let shared = [
+        BootloaderBoard::MinewsemiMx25le01,
+        BootloaderBoard::WiscoreRak3401,
+        BootloaderBoard::WiscoreRak4631Board,
+        BootloaderBoard::WismeshTag,
+    ];
+    assert!(shared.iter().all(|board| board.board_id() == 0x239A_0029));
+    let mut targets: Vec<u32> = shared.iter().map(|board| board.target_id()).collect();
+    targets.sort_unstable();
+    targets.dedup();
+    assert_eq!(targets.len(), shared.len());
+    assert_eq!(BootloaderBoard::WiscoreRak3401.target_id(), 0x2381_8A80);
+    assert_eq!(
+        BootloaderBoard::WiscoreRak3401.hw_id(),
+        "NRF_BL_239A0029_3401_DFU"
+    );
+    assert_eq!(BootloaderBoard::XiaoNrf52840Ble.target_id(), 0x2886_0044);
+    assert_eq!(BootloaderBoard::XiaoNrf52840Ble.hw_id(), "XIAO_BL_28860044");
+}
+
+#[test]
+fn generic_target_ids_are_pinned_to_the_canonical_hw_hash() {
+    for (board, expected) in [
+        (BootloaderBoard::HeltecMeshTowerV2, 0x1150_F50E),
+        (BootloaderBoard::HeltecMeshPocket, 0x0592_77F4),
+        (BootloaderBoard::HeltecT096, 0x4235_4C85),
+        (BootloaderBoard::HeltecT1, 0xFC55_6FFC),
+        (BootloaderBoard::HeltecT114, 0x0C3F_2902),
+        (BootloaderBoard::KeepteenLt1, 0xDB2E_7B51),
+        (BootloaderBoard::MinewsemiMx25le01, 0x026A_A982),
+        (BootloaderBoard::PromicroNrf52840, 0xAF79_E8CC),
+        (BootloaderBoard::T1000E, 0xE6F5_F03F),
+        (BootloaderBoard::ThinknodeM3, 0x0CA4_1DB2),
+        (BootloaderBoard::WiscoreRak3401, 0x2381_8A80),
+        (BootloaderBoard::WiscoreRak4631Board, 0x2D0D_F000),
+        (BootloaderBoard::WismeshTag, 0xC72E_9C9C),
+    ] {
+        assert_eq!(board.target_id(), expected, "{}", board.name());
+        assert_eq!(BootloaderBoard::from_target_id(expected), Some(board));
+    }
+}
+
+#[test]
+fn qualified_application_targets_cannot_collide_with_bootloader_routes() {
+    let applications = motatool::targets::BOOTLOADER_RELEVANT_APPLICATION_TARGETS;
+    assert_eq!(applications.len(), 21);
+    let mut application_ids = Vec::with_capacity(applications.len());
+    for &(target, name) in applications {
+        let derived = u32::from_le_bytes(sha256(name.as_bytes())[..4].try_into().unwrap());
+        assert_eq!(target, derived, "stale application target ID for {name}");
+        assert_eq!(motatool::targets::env_name(target), Some(name));
+        application_ids.push(target);
+    }
+    application_ids.sort_unstable();
+    application_ids.dedup();
+    assert_eq!(application_ids.len(), applications.len());
+    for board in BOOTLOADER_BOARDS {
+        assert!(
+            !application_ids.contains(&board.target_id()),
+            "{} boot target collides with an application route",
+            board.name()
+        );
     }
 }
 
@@ -300,6 +379,24 @@ fn embedded_crc_and_geometry_are_rejected() {
         .unwrap()
         .to_string();
     assert!(error.contains("bootloader update manifest"), "{error}");
+
+    let mut noncanonical_padding = make_image(BootloaderBoard::WiscoreRak3401);
+    noncanonical_padding[MANIFEST_OFFSET + 24 + "3401_DFU".len() + 1] = b'X';
+    rewrite_image_crc(&mut noncanonical_padding);
+    let error = build_bootloader(&opts(noncanonical_padding, BootloaderBoard::WiscoreRak3401))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("trailing NUL padding"), "{error}");
+
+    let mut unterminated_name = make_image(BootloaderBoard::WiscoreRak3401);
+    unterminated_name[MANIFEST_OFFSET + 24..MANIFEST_OFFSET + 40].fill(b'A');
+    rewrite_image_crc(&mut unterminated_name);
+    let error = parse_bootloader_update_manifest(&unterminated_name)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("at most 15"), "{error}");
 }
 
 #[test]
@@ -371,13 +468,14 @@ fn unsigned_and_noncanonical_packages_are_rejected_by_verify() {
     wrong_board[HEADER_LEN + off::TARGET_ID..HEADER_LEN + off::TARGET_ID + 4]
         .copy_from_slice(&XIAO_NRF52840_BLE_SENSE_BOARD_ID.to_le_bytes());
     wrong_board[HEADER_LEN + off::HW_ID..HEADER_LEN + off::HW_ID + HW_ID_LEN].fill(0);
-    let sense_hw = BootloaderBoard::XiaoNrf52840BleSense.hw_id().as_bytes();
+    let sense_hw_id = BootloaderBoard::XiaoNrf52840BleSense.hw_id();
+    let sense_hw = sense_hw_id.as_bytes();
     wrong_board[HEADER_LEN + off::HW_ID..HEADER_LEN + off::HW_ID + sense_hw.len()]
         .copy_from_slice(sense_hw);
     resign(&mut wrong_board);
     let problems = verify(&wrong_board);
     assert!(
-        problems.iter().any(|problem| problem.contains("board_id")),
+        problems.iter().any(|problem| problem.contains("target_id")),
         "{problems:?}"
     );
 
@@ -401,6 +499,19 @@ fn unsigned_and_noncanonical_packages_are_rejected_by_verify() {
         .unwrap()
         .to_string();
     assert!(error.contains("40 blocks of 1024 bytes"), "{error}");
+
+    let rak = BootloaderBoard::WiscoreRak3401;
+    let mut raw_vid_pid_target = build_bootloader(&opts(make_image(rak), rak)).unwrap().bytes;
+    raw_vid_pid_target[HEADER_LEN + off::TARGET_ID..HEADER_LEN + off::TARGET_ID + 4]
+        .copy_from_slice(&rak.board_id().to_le_bytes());
+    resign(&mut raw_vid_pid_target);
+    let problems = verify(&raw_vid_pid_target);
+    assert!(
+        problems
+            .iter()
+            .any(|problem| problem.contains("canonical target")),
+        "{problems:?}"
+    );
 }
 
 #[test]
@@ -466,7 +577,7 @@ fn vectors_and_successor_capability_are_required() {
         .err()
         .unwrap()
         .to_string();
-    assert!(error.contains("QSPI|BOOT_UPDATE"), "{error}");
+    assert!(error.contains("exact QSPI"), "{error}");
 
     let mut unknown_storage = make_image(board);
     unknown_storage[CAPS_OFFSET + 12] = BOOTLOADER_REQUIRED_STORAGE | 0x80;
@@ -476,6 +587,16 @@ fn vectors_and_successor_capability_are_required() {
         .unwrap()
         .to_string();
     assert!(error.contains("structurally valid"), "{error}");
+
+    let internal = BootloaderBoard::WiscoreRak3401;
+    let mut wrong_profile = make_image(internal);
+    wrong_profile[CAPS_OFFSET + 12] = BOOTLOADER_QSPI_STORAGE;
+    rewrite_image_crc(&mut wrong_profile);
+    let error = build_bootloader(&opts(wrong_profile, internal))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("does not match wiscore_rak3401"), "{error}");
 
     let mut nonzero_reserved = make_image(board);
     nonzero_reserved[CAPS_OFFSET + 13] = 1;
@@ -499,6 +620,20 @@ fn vectors_and_successor_capability_are_required() {
         .unwrap()
         .to_string();
     assert!(error.contains("aligned"), "{error}");
+
+    let mut duplicate_caps = make_image(board);
+    let marker: [u8; BOOTLOADER_CAPS_SIZE] = duplicate_caps
+        [CAPS_OFFSET..CAPS_OFFSET + BOOTLOADER_CAPS_SIZE]
+        .try_into()
+        .unwrap();
+    duplicate_caps[CAPS_OFFSET + 0x80..CAPS_OFFSET + 0x80 + BOOTLOADER_CAPS_SIZE]
+        .copy_from_slice(&marker);
+    rewrite_image_crc(&mut duplicate_caps);
+    let error = build_bootloader(&opts(duplicate_caps, board))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("found 2"), "{error}");
 
     let mut zero_version = opts(make_image(board), board);
     zero_version.fw_version = 0;
@@ -599,6 +734,49 @@ fn cli_builds_from_hex_and_labels_bootloader_packages() {
     assert!(stdout.contains("BOOTLOADER=true"), "{stdout}");
     assert!(stdout.contains("xiao_nrf52840_ble"), "{stdout}");
     assert!(stdout.contains("caps_apply_abi  : 3"), "{stdout}");
+
+    let rak = BootloaderBoard::WiscoreRak3401;
+    let rak_hex = dir.path().join("rak3401_bootloader.hex");
+    let rak_out = dir.path().join("rak3401.mota");
+    std::fs::write(&rak_hex, image_as_intel_hex(&make_image(rak))).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_motatool"))
+        .args([
+            "build-bootloader",
+            "--fw",
+            rak_hex.to_str().unwrap(),
+            "--board",
+            rak.name(),
+            "--sign",
+            key_path.to_str().unwrap(),
+            "--fw-version",
+            "1.2.3",
+            "--out",
+            rak_out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let blob = std::fs::read(&rak_out).unwrap();
+    assert!(verify(&blob).is_empty());
+    let manifest = Manifest::parse(&blob).unwrap();
+    assert_eq!(manifest.target_id, 0x2381_8A80);
+    assert_eq!(manifest.hw_id_str(), "NRF_BL_239A0029_3401_DFU");
+    let inspect = Command::new(env!("CARGO_BIN_EXE_motatool"))
+        .args(["inspect", rak_out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(inspect.status.success());
+    let stdout = String::from_utf8_lossy(&inspect.stdout);
+    assert!(
+        stdout.contains("bootloader_board: wiscore_rak3401"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("caps_storage    : 0x0a"), "{stdout}");
+    assert!(stdout.contains("caps_stage_kind : internal"), "{stdout}");
 }
 
 fn image_as_intel_hex(image: &[u8]) -> String {

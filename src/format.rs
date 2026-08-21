@@ -74,8 +74,8 @@ pub const NRF52_LAYOUT_LEN: usize = 24;
 pub const NRF52_LAYOUT_FLAG_SD: u8 = 0x01;
 pub const NRF52_LAYOUT_FLAG_INTERNAL_EXTRAFS: u8 = 0x02;
 pub const NRF52_LAYOUT_FLAG_QSPI: u8 = 0x04;
-/// The linked application stops at 0xE0000 so 0xE0000..0xEA000 remains available for the
-/// XIAO bootloader self-update scratch bank. This is an adjunct to QSPI staging, not a storage kind.
+/// The linked XIAO application leaves 0xE0000..0xEA000 available for the bootloader self-update scratch
+/// bank. This is an adjunct to QSPI, not a storage kind.
 pub const NRF52_LAYOUT_FLAG_BOOTLOADER_SCRATCH: u8 = 0x08;
 
 /// The mota-seeder link protocol (host ⇄ node), mirroring `src/helpers/ota/MotaSeederProto.h`.
@@ -218,7 +218,7 @@ impl Manifest {
     }
 
     /// Parse and validate a whole container: framing, format version, and that the declared geometry
-    /// matches the file length. Does *not* recompute hashes — that is [`crate::verify`].
+    /// matches the file length. Does *not* recompute hashes — that is [`crate::verify()`].
     pub fn parse(blob: &[u8]) -> Result<Manifest> {
         ensure!(
             blob.len() >= HEADER_LEN + MFL + TRAILER_LEN,

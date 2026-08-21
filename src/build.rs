@@ -1,9 +1,8 @@
 //! Assemble a `.mota` container from a firmware image.
 //!
-//! Full images are 100% Rust. A **delta** (`--base`) diffs the base against the target with detools (see
-//! [`crate::delta`] — a dev-only dependency until a pure-Rust encoder lands): the container is identical
-//! except the payload is the detools patch, `codec_id` marks the patch type, and `base_hash` pins the
-//! image the delta must be applied to.
+//! Full images and both delta codecs are 100% Rust. A **delta** (`--base`) diffs the base against the target:
+//! the container is identical except the payload is a detools-compatible patch, `codec_id` marks the patch
+//! type, and `base_hash` pins the image the delta must be applied to.
 
 use crate::crypto::{ed25519_public_from_seed, ed25519_sign, sha256};
 use crate::encode::PatchType;
@@ -141,12 +140,27 @@ fn build_delta(
             crate::encode::encode_sequential(&base_image, image),
         ),
         PatchType::InPlace => {
+            let layout = parse_nrf52_layout(image);
             let patch = match o.inplace_memory {
                 Some(memory) => {
                     validate_inplace_memory(&base_image, image, memory, o.segment_size)?;
-                    crate::encode::encode_in_place(&base_image, image, memory, o.segment_size)
+                    if let Some(layout) = layout {
+                        validate_layout_target(image, layout)?;
+                    }
+                    let patch =
+                        crate::encode::encode_in_place(&base_image, image, memory, o.segment_size);
+                    if let Some(layout) = layout {
+                        validate_explicit_inplace_layout(
+                            &patch,
+                            memory,
+                            layout,
+                            o.segment_size,
+                            o.block_size,
+                        )?;
+                    }
+                    patch
                 }
-                None => match parse_nrf52_layout(image) {
+                None => match layout {
                     Some(layout) => auto_inplace_patch(
                         &base_image,
                         image,
@@ -174,8 +188,7 @@ fn validate_inplace_memory(from: &[u8], to: &[u8], memory: u32, segment: u32) ->
         );
     }
     let minimum = (from.len() as u64)
-        .checked_add(2 * segment as u64)
-        .unwrap_or(u64::MAX)
+        .saturating_add(2 * segment as u64)
         .max(to.len() as u64);
     if minimum > memory as u64 {
         bail!(
@@ -205,6 +218,66 @@ fn align_down(value: u32, unit: u32) -> u32 {
     value & !(unit - 1)
 }
 
+fn validate_layout_target(to: &[u8], layout: Nrf52Layout) -> Result<u32> {
+    if layout.stage_ceiling <= layout.app_base || layout.linked_app_end <= layout.app_base {
+        bail!("in-place: invalid embedded nRF52 layout");
+    }
+    let linked_span = layout.linked_app_end - layout.app_base;
+    if to.len() as u64 > linked_span as u64 {
+        bail!(
+            "in-place: target image {} B exceeds embedded application region {} B",
+            to.len(),
+            linked_span
+        );
+    }
+    Ok(linked_span)
+}
+
+/// Return the page-aligned address where the application will bottom-stage an internal container.
+/// The live device additionally checks that this address is at or above its exact running EndF.
+fn internal_stage_start(patch_len: usize, block_size: u32, layout: Nrf52Layout) -> Result<u32> {
+    let total = patch_container_total(patch_len, block_size)?;
+    let span = layout
+        .stage_ceiling
+        .checked_sub(layout.app_base)
+        .ok_or_else(|| anyhow::anyhow!("in-place: invalid embedded nRF52 staging span"))?;
+    if total >= span {
+        bail!(
+            "in-place: package {total} B does not fit below staging ceiling 0x{:X}",
+            layout.stage_ceiling
+        );
+    }
+    let start = align_down(layout.stage_ceiling - total, NRF52_FLASH_PAGE);
+    if start <= layout.app_base {
+        bail!("in-place: package leaves no apply workspace");
+    }
+    Ok(start)
+}
+
+/// An explicit memory override still has to fit the target firmware's authenticated layout. For an
+/// internal store, encode first because the complete container size determines its physical source
+/// address. For an external SD/QSPI store, the source is off-chip and the linker end is the hard bound.
+fn validate_explicit_inplace_layout(
+    patch: &[u8],
+    memory: u32,
+    layout: Nrf52Layout,
+    segment: u32,
+    block_size: u32,
+) -> Result<()> {
+    let allowed = if layout.external_staging() {
+        align_down(layout.linked_app_end - layout.app_base, segment)
+    } else {
+        let source = internal_stage_start(patch.len(), block_size, layout)?;
+        align_down(source - layout.app_base, segment)
+    };
+    if memory > allowed {
+        bail!(
+            "in-place: explicit apply window {memory} B exceeds the embedded layout/source bound {allowed} B"
+        );
+    }
+    Ok(())
+}
+
 /// Encode using the largest monotonically safe workspace below the package's eventual page-aligned
 /// staging address. Re-encoding can change patch size, so candidates only move downward until the
 /// actual container fits. Externally staged SD/QSPI packages need no internal reservation and use the
@@ -219,17 +292,7 @@ fn auto_inplace_patch(
     if segment == 0 || !segment.is_power_of_two() {
         bail!("in-place: --segment-size must be a non-zero power of two");
     }
-    if layout.stage_ceiling <= layout.app_base || layout.linked_app_end <= layout.app_base {
-        bail!("in-place: invalid embedded nRF52 layout");
-    }
-    let linked_span = layout.linked_app_end - layout.app_base;
-    if to.len() as u64 > linked_span as u64 {
-        bail!(
-            "in-place: target image {} B exceeds embedded application region {} B",
-            to.len(),
-            linked_span
-        );
-    }
+    validate_layout_target(to, layout)?;
 
     if layout.external_staging() {
         let memory = align_down(layout.linked_app_end - layout.app_base, segment);
@@ -243,30 +306,16 @@ fn auto_inplace_patch(
         bail!("in-place: nRF52 layout leaves no internal staging page");
     }
     let mut memory = align_down(span - NRF52_FLASH_PAGE, segment);
-    for _ in 0..16 {
+    loop {
         validate_inplace_memory(from, to, memory, segment)?;
         let patch = crate::encode::encode_in_place(from, to, memory, segment);
-        let total = patch_container_total(patch.len(), block_size)?;
-        if total >= layout.stage_ceiling - layout.app_base {
-            bail!(
-                "in-place: package does not fit below staging ceiling 0x{:X}",
-                layout.stage_ceiling
-            );
-        }
-        let stage_start = align_down(layout.stage_ceiling - total, NRF52_FLASH_PAGE);
-        if stage_start <= layout.app_base {
-            bail!("in-place: package leaves no apply workspace");
-        }
+        let stage_start = internal_stage_start(patch.len(), block_size, layout)?;
         let allowed = align_down(stage_start - layout.app_base, segment);
         if memory <= allowed {
             return Ok(patch);
         }
         memory = allowed;
     }
-    bail!(
-        "in-place workspace did not converge below ceiling 0x{:X}",
-        layout.stage_ceiling
-    )
 }
 
 /// log2 of a power-of-two block size (1024 → 10).

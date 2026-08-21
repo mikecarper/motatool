@@ -12,7 +12,7 @@ to live in the MeshCore tree, kept **byte-for-byte compatible** with the firmwar
 | Command | State |
 |---|---|
 | `build` (full image) | ✅ byte-identical to the firmware's own output |
-| `build-bootloader` (XIAO nRF52840 OTAFIX) | ✅ signed, exact-board v3 package |
+| `build-bootloader` (application-preserving nRF52840 OTAFIX) | ✅ signed, exact-manifest v3 package |
 | `build --base` sequential (ESP32) | ✅ **pure Rust** delta (no runtime detools) — see [Deltas](#deltas) |
 | `build --base` in-place (nRF52) | ✅ **pure Rust** delta (no runtime detools) — see [Deltas](#deltas) |
 | `verify` | ✅ structure, block hashes, merkle root, full-image hash, optional Ed25519 signature |
@@ -42,8 +42,10 @@ motatool build --fw firmware.hex --out-dir ./motas
 motatool build --fw firmware.bin --sign signer.key --out-dir ./motas   # signed
 motatool build --fw https://example.org/RAK_4631_repeater.bin          # straight from a URL
 
-# package an OTAFIX XIAO bootloader (signature and nonzero version are mandatory)
+# package an OTAFIX bootloader (signature and nonzero version are mandatory)
 motatool build-bootloader --fw xiao_bootloader.hex --board xiao_nrf52840_ble \
+  --fw-version 1.2.3 --sign signer.key --out-dir ./motas
+motatool build-bootloader --fw rak3401_bootloader.hex --board wiscore_rak3401 \
   --fw-version 1.2.3 --sign signer.key --out-dir ./motas
 
 # check containers (per-file OK / FAIL; non-zero exit if any fails)
@@ -67,29 +69,53 @@ first. Firmware identity comes from the image's `EndF` trailer, overridable with
 
 ## Bootloader packages
 
-`build-bootloader` is a deliberately strict path for the two OTAFIX XIAO nRF52840 variants. It accepts
-an Intel HEX, extracts exactly `0xF4000..0xFE000` into a 40 KiB payload (filling HEX gaps with erased-flash
-`0xFF`), and refuses to write a package unless all privileged-update gates pass:
+`build-bootloader` is a deliberately strict path for application-preserving OTAFIX nRF52840 updates. It
+accepts an Intel HEX, extracts exactly `0xF4000..0xFE000` into a 40 KiB payload (filling HEX gaps with
+erased-flash `0xFF`), and refuses to write a package unless all privileged-update gates pass:
 
 - `--sign` and a nonzero `--fw-version` are mandatory; the package is format **v3** with flags exactly
   `FULL|SIGNED|BOOTLOADER`, `CODEC_FULL`, and exactly 40 blocks of 1024 bytes. Ordinary application
-  packages remain format v2. This makes older v2-only firmware reject bootloader bytes instead of treating
-  them as an application image.
+  packages remain format v2. The complete bootloader container is exactly 41,330 bytes. This makes older
+  v2-only firmware reject bootloader bytes instead of treating them as an application image.
 - The nRF52840 initial stack pointer must be 8-byte aligned and in RAM, and the reset vector must be a
   Thumb address inside the bootloader region. An erased image is rejected.
 - The 44-byte OTAFIX `bootloader_update_manifest` v1 must be unique, declare the exact region geometry,
-  match the selected board and `XIAO_DFU`, and carry the correct whole-region IEEE CRC-32 (with its CRC
-  field treated as zero during calculation).
+  match the selected board's complete `(board_id, 16-byte DEVICE_NAME field)` identity, and carry the correct
+  whole-region IEEE CRC-32 (with its CRC field treated as zero during calculation). `board_id` by itself
+  is deliberately insufficient because several boards share the same USB VID/UF2 PID.
 - The image must contain a valid `MOTABLDR` continuity marker advertising apply ABI 3 or newer, the full
-  codec, and both QSPI + bootloader-update storage capabilities. This prevents installing an older
-  bootloader that could not accept its own signed successor.
+  codec, and the board's exact successor-storage profile: `0x0E` (stage ceiling + QSPI + boot update) for
+  XIAO, or `0x0A` (stage ceiling + boot update, with the normal internal store) for internal-only boards. This
+  prevents installing an older bootloader that could not accept its own signed successor.
 
 The supported routing identities are fixed and signed:
 
-| `--board` | `target_id` / embedded `board_id` | canonical `hw_id` | `DEVICE_NAME` |
-|---|---:|---|---|
-| `xiao_nrf52840_ble` | `0x28860044` | `XIAO_BL_28860044` | `XIAO_DFU` |
-| `xiao_nrf52840_ble_sense` | `0x28860045` | `XIAO_BL_28860045` | `XIAO_DFU` |
+| `--board` | embedded `board_id` | package `target_id` | canonical `hw_id` / `DEVICE_NAME` |
+|---|---:|---:|---|
+| `xiao_nrf52840_ble` | `0x28860044` | `0x28860044` | `XIAO_BL_28860044` / `XIAO_DFU` |
+| `xiao_nrf52840_ble_sense` | `0x28860045` | `0x28860045` | `XIAO_BL_28860045` / `XIAO_DFU` |
+| `heltec_mesh_pocket` | `0x239A0071` | `0x059277F4` | `NRF_BL_239A0071_MESH_POCKET_OTA` / `MESH_POCKET_OTA` |
+| `heltec_mesh_tower_v2` | `0x239A0071` | `0x1150F50E` | `NRF_BL_239A0071_TOWER_V2_OTA` / `TOWER_V2_OTA` |
+| `heltec_t096` | `0x239A0071` | `0x42354C85` | `NRF_BL_239A0071_T096_DFU` / `T096_DFU` |
+| `heltec_t1` | `0x239A0071` | `0xFC556FFC` | `NRF_BL_239A0071_T1_DFU` / `T1_DFU` |
+| `heltec_t114` | `0x239A0071` | `0x0C3F2902` | `NRF_BL_239A0071_T114_DFU` / `T114_DFU` |
+| `keepteen_lt1` | `0x239A00B3` | `0xDB2E7B51` | `NRF_BL_239A00B3_KeepteenLT1_OTA` / `KeepteenLT1_OTA` |
+| `minewsemi_mx25le01` | `0x239A0029` | `0x026AA982` | `NRF_BL_239A0029_MX25_DFU` / `MX25_DFU` |
+| `promicro_nrf52840` | `0x239A00B3` | `0xAF79E8CC` | `NRF_BL_239A00B3_PROM_DFU` / `PROM_DFU` |
+| `t1000_e` | `0x28860057` | `0xE6F5F03F` | `NRF_BL_28860057_T1KE_DFU` / `T1KE_DFU` |
+| `thinknode_m3` | `0x239A00DA` | `0x0CA41DB2` | `NRF_BL_239A00DA_TNM3_DFU` / `TNM3_DFU` |
+| `wiscore_rak3401` | `0x239A0029` | `0x23818A80` | `NRF_BL_239A0029_3401_DFU` / `3401_DFU` |
+| `wiscore_rak4631_board` | `0x239A0029` | `0x2D0DF000` | `NRF_BL_239A0029_4631_DFU` / `4631_DFU` |
+| `wismesh_tag` | `0x239A0029` | `0xC72E9C9C` | `NRF_BL_239A0029_RTAG_DFU` / `RTAG_DFU` |
+
+Generic manifest names are 1–15 non-space printable ASCII bytes (`0x21..=0x7E`) followed by NUL padding. The generic hardware ID is
+the lossless ASCII identity `NRF_BL_<BOARDID8>_<DEVICE_NAME>`, padded with
+NULs to 32 bytes. Its package `target_id` is the little-endian first 32 bits of SHA-256 over those complete
+32 bytes. The checked-in inventory is audited for duplicate identities, hardware IDs, target hashes, and
+collisions with known application targets on every build and verification. The two XIAO identities retain
+their original routing IDs for compatibility. The collision snapshot explicitly includes all 21 MeshCore
+application targets in `tools/mota/nrf52_internal_bootloader_targets.txt`; update both lists together when
+qualifying another internal-flash target.
 
 `verify` repeats every package, signature, vector, capability-marker, embedded-manifest, board, geometry,
 and CRC gate. `inspect` labels the package as `bootloader` and prints both the embedded board manifest and
@@ -159,8 +185,15 @@ is exclusive with SD and internal ExtraFS. Older firmware without the record kee
 support; use `--inplace-memory 0x98000` when deliberately packaging for an older bootloader and both images
 fit. XIAO bootloader-update layout records use flags `QSPI|BOOTLOADER_SCRATCH = 0x0C`,
 `linked_app_end=0xE0000`, and the external staging ceiling `0xED000`; motatool requires that exact invariant
-and derives the in-place apply window only through `0xE0000`. `--inplace-memory` remains an explicit override;
-`--segment-size` defaults to 4096.
+and derives the in-place apply window only through `0xE0000`. Boards without external storage use the normal
+flags-0 layout with `linked_app_end=stage_ceiling=0xED000`. An ordinary application delta and a bootloader
+package use the same internal update slot (never both at once), bottom-aligned beneath that ceiling. Ordinary
+deltas may therefore exceed 44 KiB; motatool iterates the encoded container size until its detools apply
+window ends at or below the actual staged source. The exact 41,330-byte generic bootloader package starts at
+`0xE2000`; after verification, OTAFIX compacts its 40 KiB payload in place to `0xE2000..0xEC000` before the
+Nordic MBR copy. Firmware rejects that boot package unless its live, valid `EndF` proves the application ends
+at or below `0xE2000`. `--inplace-memory` remains an explicit override, but it is still checked against the
+embedded layout and actual encoded source; `--segment-size` defaults to 4096.
 
 **Both patch types are pure Rust** — [`src/encode.rs`](src/encode.rs) implements the detools
 `sequential` + `crle` (ESP32 A/B) and `in-place` + `crle` (nRF52 single-slot) formats (canonical bsdiff +

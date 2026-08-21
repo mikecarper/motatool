@@ -4,7 +4,7 @@
 //! leaves are folded into per-level "peaks" like incrementing a binary counter (carry = combine two equal
 //! subtrees), then the leftover peaks are bagged **right-to-left** into the final 4-byte root. This must
 //! stay byte-identical to `src/helpers/ota/MerkleTree.cpp` in the firmware — the device recomputes the same
-//! root to authenticate a fetch, so [`merkle_root`] is pinned by cross-checks against real `.mota` files.
+//! root to authenticate a fetch, so [`root`] is pinned by cross-checks against real `.mota` files.
 
 use crate::crypto::mh;
 

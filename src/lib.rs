@@ -17,7 +17,8 @@ pub mod targets;
 pub mod verify;
 
 pub use bootloader::{
-    build_bootloader, BootloaderBoard, BootloaderBuildOpts, BootloaderUpdateManifest,
+    build_bootloader, validate_bootloader_inventory, BootloaderBoard, BootloaderBuildOpts,
+    BootloaderUpdateManifest, BOOTLOADER_BOARDS,
 };
 pub use build::{build, BuildOpts, Built};
 pub use encode::PatchType;

@@ -6,11 +6,89 @@
 
 /// The PlatformIO env name for a `target_id`, if it is a known OTA-capable env.
 pub fn env_name(target_id: u32) -> Option<&'static str> {
-    TABLE
+    BOOTLOADER_RELEVANT_APPLICATION_TARGETS
         .iter()
+        .chain(TABLE.iter())
         .find(|&&(id, _)| id == target_id)
         .map(|&(_, name)| name)
 }
+
+/// Narrow collision-audit snapshot of every MeshCore application target currently mapped to one of the
+/// qualified internal-flash bootloader identities. The source is MeshCore's
+/// `tools/mota/nrf52_internal_bootloader_targets.txt`; regenerate each ID with
+/// `target_id = LE32(SHA-256(env_name)[0..4])` whenever that inventory changes. Keeping this separate from
+/// the larger generated table makes bootloader routing coverage drift visible in tests.
+pub const BOOTLOADER_RELEVANT_APPLICATION_TARGETS: &[(u32, &str)] = &[
+    (
+        0x3c60586d,
+        "Heltec_tower_v2_repeater_lora_ota_no_external_sensors",
+    ),
+    (
+        0x98411ac6,
+        "Heltec_t096_repeater_lora_ota_no_external_sensors",
+    ),
+    (
+        0xafeed10c,
+        "Heltec_t096_repeater_bridge_rs232_lora_ota_no_external_sensors",
+    ),
+    (
+        0xa529b4f5,
+        "Heltec_t1_repeater_lora_ota_no_external_sensors",
+    ),
+    (
+        0x180bbe1f,
+        "GAT562_30S_Mesh_Kit_repeater_lora_ota_no_external_sensors",
+    ),
+    (
+        0xb4d0ad97,
+        "Heltec_t114_without_display_repeater_lora_ota_no_external_sensors",
+    ),
+    (
+        0xf7e47568,
+        "Heltec_t114_repeater_lora_ota_no_external_sensors",
+    ),
+    (
+        0x144504b0,
+        "Mesh_pocket_repeater_lora_ota_no_external_sensors",
+    ),
+    (
+        0x3625bb80,
+        "KeepteenLT1_repeater_lora_ota_no_external_sensors",
+    ),
+    (
+        0x11b131e7,
+        "Minewsemi_me25ls01_repeater_lora_ota_no_external_sensors",
+    ),
+    (0xa68c09e9, "ProMicro_repeater_lora_ota_no_external_sensors"),
+    (0x7b071fa0, "t1000e_repeater_lora_ota_no_external_sensors"),
+    (
+        0xdf41affe,
+        "ThinkNode_M3_repeater_lora_ota_no_external_sensors",
+    ),
+    (0x2fa509c1, "RAK_3401_repeater_lora_ota_no_external_sensors"),
+    (0x29a0da19, "RAK_4631_repeater_lora_ota_no_external_sensors"),
+    (
+        0x76f3c984,
+        "RAK_4631_repeater_bridge_rs232_serial1_lora_ota_no_external_sensors",
+    ),
+    (
+        0x41e33a97,
+        "RAK_4631_repeater_bridge_rs232_serial2_lora_ota_no_external_sensors",
+    ),
+    (
+        0x217958b4,
+        "GAT562_Mesh_Tracker_Pro_repeater_lora_ota_no_external_sensors",
+    ),
+    (0x9aca380e, "R1Neo_repeater_lora_ota_no_external_sensors"),
+    (
+        0x6384719d,
+        "GAT562_Mesh_EVB_Pro_repeater_lora_ota_no_external_sensors",
+    ),
+    (
+        0xd1d61a8b,
+        "RAK_WisMesh_Tag_repeater_lora_ota_no_external_sensors",
+    ),
+];
 
 /// Human label for display: the env name, or `"N/A"` if unknown.
 pub fn label(target_id: u32) -> &'static str {

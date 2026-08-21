@@ -40,6 +40,17 @@ fn base_and_target() -> (Vec<u8>, Vec<u8>) {
     (base, tgt)
 }
 
+fn pseudo_random_body(len: usize, mut state: u32) -> Vec<u8> {
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect()
+}
+
 fn opts(new_fw: Vec<u8>, base_fw: Vec<u8>, ptype: PatchType) -> BuildOpts {
     BuildOpts {
         fw: new_fw,
@@ -286,4 +297,55 @@ fn qspi_auto_memory_uses_linker_bounded_external_workspace() {
             assert_eq!(flags, 0x0C, "real XIAO scratch layout flags");
         }
     }
+}
+
+#[test]
+fn shared_internal_slot_accepts_an_ordinary_delta_larger_than_44k() {
+    let base_body = pseudo_random_body(4096, 0x1234_5678);
+    let target_body = pseudo_random_body(64 * 1024, 0xA5A5_5A5A);
+    let (base_image, _) = ensure_endf(&base_body, &ident());
+    let mut options = opts(
+        with_layout(
+            target_body,
+            NRF52_APP_BASE_S140_V7,
+            NRF52_APP_END,
+            NRF52_APP_END,
+        ),
+        base_image,
+        PatchType::InPlace,
+    );
+    options.inplace_memory = None;
+
+    let built = build(&options).expect("large ordinary delta must use the dynamic shared slot");
+    assert!(built.bytes.len() > 44 * 1024);
+    assert_auto_patch_fits(&built.bytes, NRF52_APP_BASE_S140_V7, NRF52_APP_END);
+    let manifest = Manifest::parse(&built.bytes).unwrap();
+    assert!(manifest.image_size <= NRF52_APP_END - NRF52_APP_BASE_S140_V7);
+}
+
+#[test]
+fn explicit_inplace_memory_cannot_overlap_its_internal_source() {
+    let base_body = pseudo_random_body(4096, 0x1234_5678);
+    let target_body = pseudo_random_body(64 * 1024, 0xA5A5_5A5A);
+    let (base_image, _) = ensure_endf(&base_body, &ident());
+    let mut options = opts(
+        with_layout(
+            target_body,
+            NRF52_APP_BASE_S140_V7,
+            NRF52_APP_END,
+            NRF52_APP_END,
+        ),
+        base_image,
+        PatchType::InPlace,
+    );
+    options.inplace_memory = Some(NRF52_APP_END - NRF52_APP_BASE_S140_V7);
+
+    let error = match build(&options) {
+        Ok(_) => panic!("explicit workspace must stop before staged source"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("explicit apply window"),
+        "unexpected error: {error:#}"
+    );
 }
