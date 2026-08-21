@@ -1,8 +1,9 @@
 //! Content-integrity verification of a `.mota` container.
 //!
 //! Recomputes the per-block leaves from the payload, the merkle root, the full-image hash, and (if signed)
-//! the Ed25519 signature over the embedded signer key. Returns a list of problems — empty means valid. A
-//! delta's `image_hash` is not checked here (it needs the base image); `verify --base` does that separately.
+//! the Ed25519 signature over the embedded signer key. Returns a list of problems — empty means valid.
+//! A delta's `image_hash` cannot be checked without reconstructing it from the exact base image; the
+//! current `verify` command therefore checks delta container integrity but not the reconstructed image.
 
 use crate::crypto::{ed25519_verify, sha256};
 use crate::format::*;

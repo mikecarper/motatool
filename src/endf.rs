@@ -43,6 +43,14 @@ impl Nrf52Layout {
     pub fn sd_backed(self) -> bool {
         self.flags & NRF52_LAYOUT_FLAG_SD != 0
     }
+
+    pub fn qspi_backed(self) -> bool {
+        self.flags & NRF52_LAYOUT_FLAG_QSPI != 0
+    }
+
+    pub fn external_staging(self) -> bool {
+        self.sd_backed() || self.qspi_backed()
+    }
 }
 
 /// Read a validated layout record. Firmware predating the record returns `None` and keeps the legacy
@@ -64,8 +72,11 @@ pub fn parse_nrf52_layout(image: &[u8]) -> Option<Nrf52Layout> {
         linked_app_end: rd_u32(r, 16),
         stage_ceiling: rd_u32(r, 20),
     };
-    let known_flags = NRF52_LAYOUT_FLAG_SD | NRF52_LAYOUT_FLAG_INTERNAL_EXTRAFS;
+    let known_flags =
+        NRF52_LAYOUT_FLAG_SD | NRF52_LAYOUT_FLAG_INTERNAL_EXTRAFS | NRF52_LAYOUT_FLAG_QSPI;
+    let storage_flags = layout.flags & known_flags;
     if layout.flags & !known_flags != 0
+        || storage_flags.count_ones() > 1
         || !matches!(
             layout.app_base,
             NRF52_APP_BASE_S140_V6 | NRF52_APP_BASE_S140_V7
@@ -77,7 +88,7 @@ pub fn parse_nrf52_layout(image: &[u8]) -> Option<Nrf52Layout> {
     {
         return None;
     }
-    let expected_ceiling = if layout.sd_backed() {
+    let expected_ceiling = if layout.external_staging() {
         NRF52_APP_END
     } else if layout.flags & NRF52_LAYOUT_FLAG_INTERNAL_EXTRAFS != 0 {
         NRF52_EXTRAFS_START
@@ -235,5 +246,45 @@ mod tests {
             parse_nrf52_layout(&ensure_endf(b"old", &FwIdent::default()).0),
             None
         );
+    }
+
+    #[test]
+    fn validates_qspi_as_exclusive_external_staging() {
+        fn image_with_layout(flags: u8, ceiling: u32) -> Vec<u8> {
+            let mut body = vec![0x5Au8; 200];
+            body.extend_from_slice(&NRF52_LAYOUT_MAGIC);
+            body.push(NRF52_LAYOUT_VERSION);
+            body.push(flags);
+            body.extend_from_slice(&(NRF52_LAYOUT_LEN as u16).to_le_bytes());
+            body.extend_from_slice(&NRF52_APP_BASE_S140_V7.to_le_bytes());
+            body.extend_from_slice(&NRF52_APP_END.to_le_bytes());
+            body.extend_from_slice(&ceiling.to_le_bytes());
+            ensure_endf(&body, &FwIdent::default()).0
+        }
+
+        let qspi = parse_nrf52_layout(&image_with_layout(NRF52_LAYOUT_FLAG_QSPI, NRF52_APP_END))
+            .expect("valid QSPI layout");
+        assert!(qspi.qspi_backed());
+        assert!(qspi.external_staging());
+        assert!(!qspi.sd_backed());
+
+        assert_eq!(
+            parse_nrf52_layout(&image_with_layout(
+                NRF52_LAYOUT_FLAG_QSPI,
+                NRF52_EXTRAFS_START,
+            )),
+            None,
+            "external QSPI staging requires the expanded ceiling",
+        );
+        for conflict in [NRF52_LAYOUT_FLAG_SD, NRF52_LAYOUT_FLAG_INTERNAL_EXTRAFS] {
+            assert_eq!(
+                parse_nrf52_layout(&image_with_layout(
+                    NRF52_LAYOUT_FLAG_QSPI | conflict,
+                    NRF52_APP_END,
+                )),
+                None,
+                "QSPI must be exclusive with storage flag 0x{conflict:02X}",
+            );
+        }
     }
 }

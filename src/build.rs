@@ -207,7 +207,8 @@ fn align_down(value: u32, unit: u32) -> u32 {
 
 /// Encode using the largest monotonically safe workspace below the package's eventual page-aligned
 /// staging address. Re-encoding can change patch size, so candidates only move downward until the
-/// actual container fits. SD-backed packages need no internal reservation and use the full app region.
+/// actual container fits. Externally staged SD/QSPI packages need no internal reservation and use the
+/// full linked application region.
 fn auto_inplace_patch(
     from: &[u8],
     to: &[u8],
@@ -230,7 +231,7 @@ fn auto_inplace_patch(
         );
     }
 
-    if layout.sd_backed() {
+    if layout.external_staging() {
         let memory = align_down(layout.linked_app_end - layout.app_base, segment);
         validate_inplace_memory(from, to, memory, segment)?;
         return Ok(crate::encode::encode_in_place(from, to, memory, segment));

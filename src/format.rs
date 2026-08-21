@@ -66,6 +66,7 @@ pub const NRF52_LAYOUT_VERSION: u8 = 1;
 pub const NRF52_LAYOUT_LEN: usize = 24;
 pub const NRF52_LAYOUT_FLAG_SD: u8 = 0x01;
 pub const NRF52_LAYOUT_FLAG_INTERNAL_EXTRAFS: u8 = 0x02;
+pub const NRF52_LAYOUT_FLAG_QSPI: u8 = 0x04;
 
 /// The mota-seeder link protocol (host ⇄ node), mirroring `src/helpers/ota/MotaSeederProto.h`.
 ///

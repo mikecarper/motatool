@@ -34,9 +34,9 @@ use std::sync::Arc;
     name = "motatool",
     version,
     about = "Build, verify, inspect, and serve MeshCore .mota firmware-update containers.",
-    long_about = "A .mota is a signed, self-verifying package of a firmware update that MeshCore nodes \
-                  fetch over LoRa, block by block. This tool makes those packages, checks them, and (soon) \
-                  serves a folder of them to a node."
+    long_about = "A .mota is a self-verifying, optionally signed package of a firmware update that \
+                  MeshCore nodes fetch over LoRa, block by block. This tool builds full or delta \
+                  packages, checks them, and serves a folder of them to a node."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -45,9 +45,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Package a firmware as a .mota (a full image; delta support is coming).
+    /// Package a firmware as a full or delta .mota.
     Build(BuildArgs),
-    /// Validate .mota files (block hashes, merkle root, image hash, signature).
+    /// Validate .mota files (block hashes, merkle root, full-image hash, optional signature).
     Verify(VerifyArgs),
     /// Print every field of a .mota's manifest.
     Inspect(InspectArgs),

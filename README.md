@@ -2,7 +2,7 @@
 
 Build, verify, inspect, and serve **MeshCore `.mota` firmware-update containers**.
 
-A `.mota` is a signed, self-verifying package of a firmware update that [MeshCore](https://github.com/meshcore-dev/MeshCore)
+A `.mota` is a self-verifying, optionally signed package of a firmware update that [MeshCore](https://github.com/meshcore-dev/MeshCore)
 nodes fetch over LoRa, block by block. This tool makes those packages, checks them, serves a folder of them
 to a node, and diffs firmware into tiny delta updates. It is a Rust rewrite of the C++ `motatool` that used
 to live in the MeshCore tree, kept **byte-for-byte compatible** with the firmware's on-wire format.
@@ -14,7 +14,7 @@ to live in the MeshCore tree, kept **byte-for-byte compatible** with the firmwar
 | `build` (full image) | ✅ byte-identical to the firmware's own output |
 | `build --base` sequential (ESP32) | ✅ **pure Rust** delta (no runtime detools) — see [Deltas](#deltas) |
 | `build --base` in-place (nRF52) | ✅ **pure Rust** delta (no runtime detools) — see [Deltas](#deltas) |
-| `verify` | ✅ structure, block hashes, merkle root, image hash, Ed25519 signature |
+| `verify` | ✅ structure, block hashes, merkle root, full-image hash, optional Ed25519 signature |
 | `inspect` | ✅ dump every manifest field |
 | `keygen` | ✅ Ed25519 signing keypair |
 | `serve` (USB serial + WiFi TCP) | ✅ folder relay + pull-to-folder capture + `--seed` warm-start — see [Serve](#serve) |
@@ -117,7 +117,9 @@ exactly that image on-device, and its 8-byte `base_hash` is checked against the 
 The delta payload is a **detools** patch (`--compression crle`, matching the firmware's compile-time decoder
 config). For `--patch-type in-place`, current nRF52 firmware embeds its resolved app base, storage type,
 and safe staging ceiling immediately before `EndF`; motatool uses that record plus the actual patch size
-to choose the largest safe `memory_size`. Older firmware without the record keeps the conservative
+to choose the largest safe `memory_size`. SD- and QSPI-backed layouts stage externally, so they use the
+full linked application region without reserving internal flash for the container. The QSPI layout flag
+is exclusive with SD and internal ExtraFS. Older firmware without the record keeps the conservative
 `0x98000` default. Expanded auto-sized packages require an OTAFIX bootloader with staging-ceiling handoff
 support; use `--inplace-memory 0x98000` when deliberately packaging for an older bootloader and both images
 fit. `--inplace-memory` remains an explicit override; `--segment-size` defaults to 4096.
