@@ -5,6 +5,7 @@
 //! A delta's `image_hash` cannot be checked without reconstructing it from the exact base image; the
 //! current `verify` command therefore checks delta container integrity but not the reconstructed image.
 
+use crate::bootloader::validate_bootloader_package;
 use crate::crypto::{ed25519_verify, sha256};
 use crate::format::*;
 use crate::merkle;
@@ -57,6 +58,14 @@ pub fn verify(blob: &[u8]) -> Vec<String> {
     // 5) a distributed container must not be pre-approved.
     if m.is_approved() {
         problems.push("container is pre-approved (must be FF FF FF FF on the wire)".into());
+    }
+
+    // 6) Bootloader updates are a strict v3-only, signed, exact-board subtype. This validates the
+    // raw-region geometry, canonical routing identity, vectors, embedded OTAFIX manifest, and its CRC.
+    if m.is_bootloader() {
+        if let Err(error) = validate_bootloader_package(&m, payload) {
+            problems.push(format!("invalid bootloader package: {error:#}"));
+        }
     }
 
     problems

@@ -2,11 +2,15 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use motatool::bootloader::{
+    parse_bootloader_capabilities, parse_bootloader_update_manifest, validate_bootloader_package,
+    BootloaderBoard, BootloaderBuildOpts,
+};
 use motatool::crypto::{ed25519_keygen, load_key32};
 use motatool::endf::{pack_version, target_id_for_env, version_str};
-use motatool::input::read_input;
+use motatool::input::{read_bootloader_hex, read_input};
 use motatool::serve::{open_serial, open_tcp, serve_loop, Folder, SeederCore};
-use motatool::{build, targets, verify, BuildOpts, Codec, Manifest, PatchType};
+use motatool::{build, build_bootloader, targets, verify, BuildOpts, Codec, Manifest, PatchType};
 
 #[derive(Clone, Copy, ValueEnum)]
 enum CliPatchType {
@@ -20,6 +24,23 @@ impl From<CliPatchType> for PatchType {
         match c {
             CliPatchType::Sequential => PatchType::Sequential,
             CliPatchType::InPlace => PatchType::InPlace,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CliBootloaderBoard {
+    #[value(name = "xiao_nrf52840_ble", alias = "xiao-nrf52840-ble")]
+    XiaoNrf52840Ble,
+    #[value(name = "xiao_nrf52840_ble_sense", alias = "xiao-nrf52840-ble-sense")]
+    XiaoNrf52840BleSense,
+}
+
+impl From<CliBootloaderBoard> for BootloaderBoard {
+    fn from(board: CliBootloaderBoard) -> Self {
+        match board {
+            CliBootloaderBoard::XiaoNrf52840Ble => BootloaderBoard::XiaoNrf52840Ble,
+            CliBootloaderBoard::XiaoNrf52840BleSense => BootloaderBoard::XiaoNrf52840BleSense,
         }
     }
 }
@@ -47,6 +68,8 @@ struct Cli {
 enum Command {
     /// Package a firmware as a full or delta .mota.
     Build(BuildArgs),
+    /// Package a board-bound OTAFIX XIAO bootloader Intel HEX as a signed v3 .mota.
+    BuildBootloader(BuildBootloaderArgs),
     /// Validate .mota files (block hashes, merkle root, full-image hash, optional signature).
     Verify(VerifyArgs),
     /// Print every field of a .mota's manifest.
@@ -55,6 +78,28 @@ enum Command {
     Keygen(KeygenArgs),
     /// Serve a folder of .mota to a node over USB serial or WiFi, and capture pull-to-folder downloads.
     Serve(ServeArgs),
+}
+
+#[derive(Args)]
+struct BuildBootloaderArgs {
+    /// OTAFIX bootloader Intel HEX; only 0xF4000..0xFE000 is extracted and gaps become 0xFF.
+    #[arg(long)]
+    fw: String,
+    /// Exact XIAO variant; it must match the embedded bootloader update manifest.
+    #[arg(long, value_enum)]
+    board: CliBootloaderBoard,
+    /// Ed25519 private key (hex or raw 32 bytes, from `keygen`). Mandatory for bootloader packages.
+    #[arg(long)]
+    sign: String,
+    /// Nonzero package version label, e.g. 1.1.0.
+    #[arg(long = "fw-version")]
+    fw_version: String,
+    /// Output directory; the file is auto-named. Default: current directory.
+    #[arg(long = "out-dir", default_value = ".")]
+    out_dir: String,
+    /// Exact output path (overrides --out-dir and the auto-name).
+    #[arg(long)]
+    out: Option<String>,
 }
 
 #[derive(Args)]
@@ -163,6 +208,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Build(a) => cmd_build(a),
+        Command::BuildBootloader(a) => cmd_build_bootloader(a),
         Command::Verify(a) => return cmd_verify(a),
         Command::Inspect(a) => cmd_inspect(a),
         Command::Keygen(a) => cmd_keygen(a),
@@ -270,6 +316,67 @@ fn cmd_build(a: BuildArgs) -> Result<()> {
     Ok(())
 }
 
+fn cmd_build_bootloader(a: BuildBootloaderArgs) -> Result<()> {
+    let board: BootloaderBoard = a.board.into();
+    let image = read_bootloader_hex(&a.fw)?;
+    let sign_seed = load_key32(&a.sign).context("--sign")?;
+    let fw_version = pack_version(&a.fw_version).context("--fw-version")?;
+    let built = build_bootloader(&BootloaderBuildOpts {
+        image,
+        board,
+        fw_version,
+        sign_seed,
+    })?;
+
+    let problems = verify(&built.bytes);
+    if !problems.is_empty() {
+        bail!(
+            "internal error: built bootloader .mota fails verification: {}",
+            problems.join("; ")
+        );
+    }
+
+    let out_path = match &a.out {
+        Some(path) => {
+            if let Some(parent) = Path::new(path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+            }
+            path.clone()
+        }
+        None => {
+            std::fs::create_dir_all(&a.out_dir).ok();
+            Path::new(&a.out_dir)
+                .join(&built.suggested_name)
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    std::fs::write(&out_path, &built.bytes).with_context(|| format!("cannot write {out_path}"))?;
+
+    let manifest = &built.manifest;
+    let payload = &built.bytes
+        [manifest.payload_off()..manifest.payload_off() + manifest.payload_size as usize];
+    let embedded = parse_bootloader_update_manifest(payload)?;
+    println!("wrote {out_path}");
+    println!(
+        "  bootloader  board={}  target={:08X}  v{}  signed",
+        board.name(),
+        manifest.target_id,
+        version_str(manifest.fw_version),
+    );
+    println!(
+        "  region=0x{:08X}..0x{:08X}  image={}B  blocks={}  total={}B",
+        embedded.image_start,
+        embedded.image_start + embedded.image_size,
+        manifest.image_size,
+        manifest.block_count,
+        built.bytes.len()
+    );
+    Ok(())
+}
+
 fn cmd_verify(a: VerifyArgs) -> ExitCode {
     let expect_pub = match a.pub_key.as_deref().map(load_key32).transpose() {
         Ok(p) => p,
@@ -303,9 +410,9 @@ fn cmd_verify(a: VerifyArgs) -> ExitCode {
         match (&parsed, problems.is_empty()) {
             (Some(m), true) => println!(
                 "OK    {file} : {} target={:08X} [{}] v{} hw={} {} blocks={} size={}",
-                if m.is_full() { "full" } else { "delta" },
+                kind_label(m),
                 m.target_id,
-                targets::label(m.target_id),
+                target_label(m),
                 version_str(m.fw_version),
                 if m.hw_id_str().is_empty() {
                     "?".into()
@@ -336,18 +443,20 @@ fn cmd_inspect(a: InspectArgs) -> Result<()> {
 
     let codec = m.codec().map(Codec::label).unwrap_or("?");
     println!("total_size     : {}", blob.len());
+    println!("package_kind   : {}", kind_label(&m));
     println!("format_ver     : {}", m.format_ver);
     println!(
-        "flags          : 0x{:02x}  FULL={} SIGNED={}",
+        "flags          : 0x{:02x}  FULL={} SIGNED={} BOOTLOADER={}",
         m.flags,
         m.is_full(),
-        m.is_signed()
+        m.is_signed(),
+        m.is_bootloader()
     );
     println!("hash_algo      : 0x{:02x} (sha2-256)", m.hash_algo);
     println!(
         "target_id      : 0x{:08x}  ({})",
         m.target_id,
-        targets::label(m.target_id)
+        target_label(&m)
     );
     println!(
         "fw_version     : {}  (0x{:08x})",
@@ -395,6 +504,25 @@ fn cmd_inspect(a: InspectArgs) -> Result<()> {
         }
     );
     println!("leaves[]       : {} x 4 bytes", m.block_count);
+    if m.is_bootloader() {
+        let payload = &blob[m.payload_off()..m.payload_off() + m.payload_size as usize];
+        let embedded = validate_bootloader_package(&m, payload)
+            .context("invalid bootloader package contract")?;
+        let capabilities = parse_bootloader_capabilities(payload)
+            .context("invalid embedded bootloader capability marker")?;
+        let board = BootloaderBoard::from_board_id(embedded.board_id)
+            .map(BootloaderBoard::name)
+            .unwrap_or("unsupported");
+        println!("bootloader_board: {board}");
+        println!("embedded_offset : 0x{:04x}", embedded.offset);
+        println!("embedded_board  : 0x{:08x}", embedded.board_id);
+        println!("embedded_device : {}", embedded.device_name_str());
+        println!("embedded_crc32  : 0x{:08x}", embedded.crc32);
+        println!("caps_offset     : 0x{:04x}", capabilities.offset);
+        println!("caps_apply_abi  : {}", capabilities.apply_abi);
+        println!("caps_codec_mask : 0x{:04x}", capabilities.codec_mask);
+        println!("caps_storage    : 0x{:02x}", capabilities.storage_flags);
+    }
     Ok(())
 }
 
@@ -430,9 +558,13 @@ fn cmd_serve(a: ServeArgs) -> Result<()> {
             s.path.file_name().unwrap_or_default().to_string_lossy(),
             hex::encode_upper(m.merkle_root),
             m.target_id,
-            targets::label(m.target_id),
+            target_label(m),
             version_str(m.fw_version),
-            m.codec().map(Codec::name_tag).unwrap_or("?"),
+            if m.is_bootloader() {
+                "bootloader"
+            } else {
+                m.codec().map(Codec::name_tag).unwrap_or("?")
+            },
             if m.is_signed() { "signed" } else { "unsigned" },
             m.block_count,
             s.bytes.len()
@@ -516,9 +648,22 @@ fn cmd_serve(a: ServeArgs) -> Result<()> {
 }
 
 fn kind_label(m: &Manifest) -> &'static str {
+    if m.is_bootloader() {
+        return "bootloader";
+    }
     match m.codec() {
         Some(Codec::Full) | None if m.is_full() => "full",
         Some(Codec::DetoolsInplace) => "in-place delta",
         _ => "sequential delta",
+    }
+}
+
+fn target_label(m: &Manifest) -> &'static str {
+    if m.is_bootloader() {
+        BootloaderBoard::from_board_id(m.target_id)
+            .map(BootloaderBoard::name)
+            .unwrap_or("unsupported bootloader board")
+    } else {
+        targets::label(m.target_id)
     }
 }

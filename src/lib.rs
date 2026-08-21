@@ -4,6 +4,7 @@
 //! to the MeshCore firmware (see `format`, `merkle`, `endf`, `crypto`); the byte layout is pinned by tests
 //! and cross-checked against real containers. Everything else is idiomatic Rust over well-known crates.
 
+pub mod bootloader;
 pub mod build;
 pub mod crypto;
 pub mod encode;
@@ -15,6 +16,9 @@ pub mod serve;
 pub mod targets;
 pub mod verify;
 
+pub use bootloader::{
+    build_bootloader, BootloaderBoard, BootloaderBuildOpts, BootloaderUpdateManifest,
+};
 pub use build::{build, BuildOpts, Built};
 pub use encode::PatchType;
 pub use format::{Codec, FwIdent, Manifest};

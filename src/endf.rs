@@ -48,6 +48,10 @@ impl Nrf52Layout {
         self.flags & NRF52_LAYOUT_FLAG_QSPI != 0
     }
 
+    pub fn bootloader_scratch(self) -> bool {
+        self.flags & NRF52_LAYOUT_FLAG_BOOTLOADER_SCRATCH != 0
+    }
+
     pub fn external_staging(self) -> bool {
         self.sd_backed() || self.qspi_backed()
     }
@@ -72,19 +76,29 @@ pub fn parse_nrf52_layout(image: &[u8]) -> Option<Nrf52Layout> {
         linked_app_end: rd_u32(r, 16),
         stage_ceiling: rd_u32(r, 20),
     };
-    let known_flags =
+    let storage_mask =
         NRF52_LAYOUT_FLAG_SD | NRF52_LAYOUT_FLAG_INTERNAL_EXTRAFS | NRF52_LAYOUT_FLAG_QSPI;
-    let storage_flags = layout.flags & known_flags;
+    let storage_flags = layout.flags & storage_mask;
+    let known_flags = storage_mask | NRF52_LAYOUT_FLAG_BOOTLOADER_SCRATCH;
+    let scratch_layout = layout.bootloader_scratch();
     if layout.flags & !known_flags != 0
         || storage_flags.count_ones() > 1
         || !matches!(
             layout.app_base,
             NRF52_APP_BASE_S140_V6 | NRF52_APP_BASE_S140_V7
         )
-        || !matches!(layout.linked_app_end, NRF52_EXTRAFS_START | NRF52_APP_END)
+        || !matches!(
+            layout.linked_app_end,
+            NRF52_EXTRAFS_START | NRF52_QSPI_LINKED_APP_END | NRF52_APP_END
+        )
         || !matches!(layout.stage_ceiling, NRF52_EXTRAFS_START | NRF52_APP_END)
         || layout.app_base >= layout.linked_app_end
         || layout.linked_app_end > NRF52_APP_END
+        || (scratch_layout
+            && (!layout.qspi_backed()
+                || layout.linked_app_end != NRF52_QSPI_LINKED_APP_END
+                || layout.stage_ceiling != NRF52_APP_END))
+        || (!scratch_layout && layout.linked_app_end == NRF52_QSPI_LINKED_APP_END)
     {
         return None;
     }
@@ -250,20 +264,24 @@ mod tests {
 
     #[test]
     fn validates_qspi_as_exclusive_external_staging() {
-        fn image_with_layout(flags: u8, ceiling: u32) -> Vec<u8> {
+        fn image_with_layout(flags: u8, linked_end: u32, ceiling: u32) -> Vec<u8> {
             let mut body = vec![0x5Au8; 200];
             body.extend_from_slice(&NRF52_LAYOUT_MAGIC);
             body.push(NRF52_LAYOUT_VERSION);
             body.push(flags);
             body.extend_from_slice(&(NRF52_LAYOUT_LEN as u16).to_le_bytes());
             body.extend_from_slice(&NRF52_APP_BASE_S140_V7.to_le_bytes());
-            body.extend_from_slice(&NRF52_APP_END.to_le_bytes());
+            body.extend_from_slice(&linked_end.to_le_bytes());
             body.extend_from_slice(&ceiling.to_le_bytes());
             ensure_endf(&body, &FwIdent::default()).0
         }
 
-        let qspi = parse_nrf52_layout(&image_with_layout(NRF52_LAYOUT_FLAG_QSPI, NRF52_APP_END))
-            .expect("valid QSPI layout");
+        let qspi = parse_nrf52_layout(&image_with_layout(
+            NRF52_LAYOUT_FLAG_QSPI,
+            NRF52_APP_END,
+            NRF52_APP_END,
+        ))
+        .expect("valid QSPI layout");
         assert!(qspi.qspi_backed());
         assert!(qspi.external_staging());
         assert!(!qspi.sd_backed());
@@ -271,6 +289,7 @@ mod tests {
         assert_eq!(
             parse_nrf52_layout(&image_with_layout(
                 NRF52_LAYOUT_FLAG_QSPI,
+                NRF52_APP_END,
                 NRF52_EXTRAFS_START,
             )),
             None,
@@ -281,9 +300,64 @@ mod tests {
                 parse_nrf52_layout(&image_with_layout(
                     NRF52_LAYOUT_FLAG_QSPI | conflict,
                     NRF52_APP_END,
+                    NRF52_APP_END,
                 )),
                 None,
                 "QSPI must be exclusive with storage flag 0x{conflict:02X}",
+            );
+        }
+
+        let xiao = parse_nrf52_layout(&image_with_layout(
+            NRF52_LAYOUT_FLAG_QSPI | NRF52_LAYOUT_FLAG_BOOTLOADER_SCRATCH,
+            NRF52_QSPI_LINKED_APP_END,
+            NRF52_APP_END,
+        ))
+        .expect("XIAO QSPI linked end below the external staging ceiling is valid");
+        assert_eq!(xiao.flags, 0x0C);
+        assert!(xiao.bootloader_scratch());
+        assert_eq!(xiao.linked_app_end, NRF52_QSPI_LINKED_APP_END);
+        assert_eq!(xiao.stage_ceiling, NRF52_APP_END);
+
+        assert_eq!(
+            parse_nrf52_layout(&image_with_layout(
+                NRF52_LAYOUT_FLAG_QSPI,
+                NRF52_QSPI_LINKED_APP_END,
+                NRF52_APP_END,
+            )),
+            None,
+            "the 0xE0000 linked end requires the bootloader-scratch flag",
+        );
+
+        for (flags, linked_end, ceiling, reason) in [
+            (
+                NRF52_LAYOUT_FLAG_BOOTLOADER_SCRATCH,
+                NRF52_QSPI_LINKED_APP_END,
+                NRF52_APP_END,
+                "scratch without QSPI",
+            ),
+            (
+                NRF52_LAYOUT_FLAG_QSPI | NRF52_LAYOUT_FLAG_BOOTLOADER_SCRATCH,
+                NRF52_APP_END,
+                NRF52_APP_END,
+                "scratch with wrong linked end",
+            ),
+            (
+                NRF52_LAYOUT_FLAG_QSPI | NRF52_LAYOUT_FLAG_BOOTLOADER_SCRATCH,
+                NRF52_QSPI_LINKED_APP_END,
+                NRF52_EXTRAFS_START,
+                "scratch with wrong staging ceiling",
+            ),
+            (
+                NRF52_LAYOUT_FLAG_QSPI | NRF52_LAYOUT_FLAG_BOOTLOADER_SCRATCH | 0x80,
+                NRF52_QSPI_LINKED_APP_END,
+                NRF52_APP_END,
+                "scratch with unknown flag",
+            ),
+        ] {
+            assert_eq!(
+                parse_nrf52_layout(&image_with_layout(flags, linked_end, ceiling)),
+                None,
+                "invalid {reason} was accepted",
             );
         }
     }

@@ -12,6 +12,7 @@ to live in the MeshCore tree, kept **byte-for-byte compatible** with the firmwar
 | Command | State |
 |---|---|
 | `build` (full image) | ✅ byte-identical to the firmware's own output |
+| `build-bootloader` (XIAO nRF52840 OTAFIX) | ✅ signed, exact-board v3 package |
 | `build --base` sequential (ESP32) | ✅ **pure Rust** delta (no runtime detools) — see [Deltas](#deltas) |
 | `build --base` in-place (nRF52) | ✅ **pure Rust** delta (no runtime detools) — see [Deltas](#deltas) |
 | `verify` | ✅ structure, block hashes, merkle root, full-image hash, optional Ed25519 signature |
@@ -41,6 +42,10 @@ motatool build --fw firmware.hex --out-dir ./motas
 motatool build --fw firmware.bin --sign signer.key --out-dir ./motas   # signed
 motatool build --fw https://example.org/RAK_4631_repeater.bin          # straight from a URL
 
+# package an OTAFIX XIAO bootloader (signature and nonzero version are mandatory)
+motatool build-bootloader --fw xiao_bootloader.hex --board xiao_nrf52840_ble \
+  --fw-version 1.2.3 --sign signer.key --out-dir ./motas
+
 # check containers (per-file OK / FAIL; non-zero exit if any fails)
 motatool verify ./motas/*.mota
 motatool verify update.mota --pub signer.key.pub
@@ -59,6 +64,36 @@ motatool serve --dir ./motas --tcp 192.168.1.50:5001 -v        # over WiFi (ESP3
 `--fw` accepts a file path or an `http(s)://` URL; a `.hex` (nRF52/STM32 build) is parsed to its flat image
 first. Firmware identity comes from the image's `EndF` trailer, overridable with `--target-env` /
 `--target-id`, `--fw-version`, `--hw-id`.
+
+## Bootloader packages
+
+`build-bootloader` is a deliberately strict path for the two OTAFIX XIAO nRF52840 variants. It accepts
+an Intel HEX, extracts exactly `0xF4000..0xFE000` into a 40 KiB payload (filling HEX gaps with erased-flash
+`0xFF`), and refuses to write a package unless all privileged-update gates pass:
+
+- `--sign` and a nonzero `--fw-version` are mandatory; the package is format **v3** with flags exactly
+  `FULL|SIGNED|BOOTLOADER`, `CODEC_FULL`, and exactly 40 blocks of 1024 bytes. Ordinary application
+  packages remain format v2. This makes older v2-only firmware reject bootloader bytes instead of treating
+  them as an application image.
+- The nRF52840 initial stack pointer must be 8-byte aligned and in RAM, and the reset vector must be a
+  Thumb address inside the bootloader region. An erased image is rejected.
+- The 44-byte OTAFIX `bootloader_update_manifest` v1 must be unique, declare the exact region geometry,
+  match the selected board and `XIAO_DFU`, and carry the correct whole-region IEEE CRC-32 (with its CRC
+  field treated as zero during calculation).
+- The image must contain a valid `MOTABLDR` continuity marker advertising apply ABI 3 or newer, the full
+  codec, and both QSPI + bootloader-update storage capabilities. This prevents installing an older
+  bootloader that could not accept its own signed successor.
+
+The supported routing identities are fixed and signed:
+
+| `--board` | `target_id` / embedded `board_id` | canonical `hw_id` | `DEVICE_NAME` |
+|---|---:|---|---|
+| `xiao_nrf52840_ble` | `0x28860044` | `XIAO_BL_28860044` | `XIAO_DFU` |
+| `xiao_nrf52840_ble_sense` | `0x28860045` | `XIAO_BL_28860045` | `XIAO_DFU` |
+
+`verify` repeats every package, signature, vector, capability-marker, embedded-manifest, board, geometry,
+and CRC gate. `inspect` labels the package as `bootloader` and prints both the embedded board manifest and
+the `MOTABLDR` capability values.
 
 ## Serve
 
@@ -122,7 +157,10 @@ full linked application region without reserving internal flash for the containe
 is exclusive with SD and internal ExtraFS. Older firmware without the record keeps the conservative
 `0x98000` default. Expanded auto-sized packages require an OTAFIX bootloader with staging-ceiling handoff
 support; use `--inplace-memory 0x98000` when deliberately packaging for an older bootloader and both images
-fit. `--inplace-memory` remains an explicit override; `--segment-size` defaults to 4096.
+fit. XIAO bootloader-update layout records use flags `QSPI|BOOTLOADER_SCRATCH = 0x0C`,
+`linked_app_end=0xE0000`, and the external staging ceiling `0xED000`; motatool requires that exact invariant
+and derives the in-place apply window only through `0xE0000`. `--inplace-memory` remains an explicit override;
+`--segment-size` defaults to 4096.
 
 **Both patch types are pure Rust** — [`src/encode.rs`](src/encode.rs) implements the detools
 `sequential` + `crle` (ESP32 A/B) and `in-place` + `crle` (nRF52 single-slot) formats (canonical bsdiff +

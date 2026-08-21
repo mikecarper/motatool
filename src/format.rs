@@ -14,10 +14,15 @@ pub const HEADER_LEN: usize = 8; // MAGIC(4) + total_size(4)
 pub const TRAILER_LEN: usize = 5;
 
 // ---- manifest constants ----
+/// Ordinary application-package format version.
 pub const FORMAT_VER: u8 = 0x02;
+/// Bootloader-package format version. Keeping this distinct makes pre-bootloader-update firmware
+/// reject the container before it can mistake the raw bootloader region for an application image.
+pub const BOOTLOADER_FORMAT_VER: u8 = 0x03;
 pub const HASH_ALGO_SHA256: u8 = 0x12;
 pub const MFLAG_FULL: u8 = 0x01;
 pub const MFLAG_SIGNED: u8 = 0x02;
+pub const MFLAG_BOOTLOADER: u8 = 0x04;
 pub const APPROVAL_NONE: [u8; 4] = [0xFF; 4]; // required on the wire
 pub const APPROVAL_YES: [u8; 4] = *b"APRV";
 pub const MFL: usize = 197; // manifest-minus-leaves length (constant)
@@ -60,6 +65,8 @@ pub const NRF52_APP_BASE_S140_V6: u32 = 0x0002_6000;
 pub const NRF52_APP_BASE_S140_V7: u32 = 0x0002_7000;
 pub const NRF52_EXTRAFS_START: u32 = 0x000D_4000;
 pub const NRF52_APP_END: u32 = 0x000E_D000;
+/// XIAO QSPI builds may link through 0xE0000 while their external-staging ceiling remains 0xED000.
+pub const NRF52_QSPI_LINKED_APP_END: u32 = 0x000E_0000;
 pub const NRF52_FLASH_PAGE: u32 = 4096;
 pub const NRF52_LAYOUT_MAGIC: [u8; 8] = *b"mOTALay1";
 pub const NRF52_LAYOUT_VERSION: u8 = 1;
@@ -67,6 +74,9 @@ pub const NRF52_LAYOUT_LEN: usize = 24;
 pub const NRF52_LAYOUT_FLAG_SD: u8 = 0x01;
 pub const NRF52_LAYOUT_FLAG_INTERNAL_EXTRAFS: u8 = 0x02;
 pub const NRF52_LAYOUT_FLAG_QSPI: u8 = 0x04;
+/// The linked application stops at 0xE0000 so 0xE0000..0xEA000 remains available for the
+/// XIAO bootloader self-update scratch bank. This is an adjunct to QSPI staging, not a storage kind.
+pub const NRF52_LAYOUT_FLAG_BOOTLOADER_SCRATCH: u8 = 0x08;
 
 /// The mota-seeder link protocol (host ⇄ node), mirroring `src/helpers/ota/MotaSeederProto.h`.
 ///
@@ -181,6 +191,9 @@ impl Manifest {
     pub fn is_signed(&self) -> bool {
         self.flags & MFLAG_SIGNED != 0
     }
+    pub fn is_bootloader(&self) -> bool {
+        self.flags & MFLAG_BOOTLOADER != 0
+    }
     pub fn is_approved(&self) -> bool {
         self.approval == APPROVAL_YES
     }
@@ -222,9 +235,21 @@ impl Manifest {
         let mf = &blob[HEADER_LEN..];
         let format_ver = mf[off::FORMAT_VER];
         ensure!(
-            format_ver == FORMAT_VER,
+            matches!(format_ver, FORMAT_VER | BOOTLOADER_FORMAT_VER),
             "unsupported format_ver {format_ver}"
         );
+        let flags = mf[off::FLAGS];
+        match format_ver {
+            FORMAT_VER => ensure!(
+                flags & !(MFLAG_FULL | MFLAG_SIGNED) == 0,
+                "format_ver 2 flags may contain only FULL|SIGNED"
+            ),
+            BOOTLOADER_FORMAT_VER => ensure!(
+                flags == MFLAG_FULL | MFLAG_SIGNED | MFLAG_BOOTLOADER,
+                "format_ver 3 flags must be exactly FULL|SIGNED|BOOTLOADER (0x07)"
+            ),
+            _ => unreachable!(),
+        }
 
         let block_size_log2 = mf[off::BLOCK_SIZE_LOG2];
         let payload_size = rd_u32(mf, off::PAYLOAD_SIZE);
@@ -241,7 +266,7 @@ impl Manifest {
 
         let m = Manifest {
             format_ver,
-            flags: mf[off::FLAGS],
+            flags,
             hash_algo: mf[off::HASH_ALGO],
             target_id: rd_u32(mf, off::TARGET_ID),
             fw_version: rd_u32(mf, off::FW_VERSION),

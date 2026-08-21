@@ -10,8 +10,9 @@ mod common;
 use motatool::endf::ensure_endf;
 use motatool::format::{
     NRF52_APP_BASE_S140_V6, NRF52_APP_BASE_S140_V7, NRF52_APP_END, NRF52_EXTRAFS_START,
-    NRF52_FALLBACK_INPLACE_MEMORY, NRF52_FLASH_PAGE, NRF52_LAYOUT_FLAG_QSPI, NRF52_LAYOUT_LEN,
-    NRF52_LAYOUT_MAGIC, NRF52_LAYOUT_VERSION,
+    NRF52_FALLBACK_INPLACE_MEMORY, NRF52_FLASH_PAGE, NRF52_LAYOUT_FLAG_BOOTLOADER_SCRATCH,
+    NRF52_LAYOUT_FLAG_QSPI, NRF52_LAYOUT_LEN, NRF52_LAYOUT_MAGIC, NRF52_LAYOUT_VERSION,
+    NRF52_QSPI_LINKED_APP_END,
 };
 use motatool::{build, verify, BuildOpts, Codec, FwIdent, Manifest, PatchType};
 
@@ -252,14 +253,24 @@ fn auto_memory_uses_embedded_layout_and_legacy_fallback() {
 fn qspi_auto_memory_uses_linker_bounded_external_workspace() {
     let (base_body, tgt_body) = base_and_target();
     let (base_image, _) = ensure_endf(&base_body, &ident());
-    for linked_end in [NRF52_APP_END, NRF52_EXTRAFS_START] {
+    for linked_end in [
+        NRF52_APP_END,
+        NRF52_QSPI_LINKED_APP_END,
+        NRF52_EXTRAFS_START,
+    ] {
+        let flags = NRF52_LAYOUT_FLAG_QSPI
+            | if linked_end == NRF52_QSPI_LINKED_APP_END {
+                NRF52_LAYOUT_FLAG_BOOTLOADER_SCRATCH
+            } else {
+                0
+            };
         let mut qspi = opts(
             with_layout_flags(
                 tgt_body.clone(),
                 NRF52_APP_BASE_S140_V7,
                 linked_end,
                 NRF52_APP_END,
-                NRF52_LAYOUT_FLAG_QSPI,
+                flags,
             ),
             base_image.clone(),
             PatchType::InPlace,
@@ -271,5 +282,8 @@ fn qspi_auto_memory_uses_linker_bounded_external_workspace() {
             patch_memory(&built.bytes),
             linked_end - NRF52_APP_BASE_S140_V7,
         );
+        if linked_end == NRF52_QSPI_LINKED_APP_END {
+            assert_eq!(flags, 0x0C, "real XIAO scratch layout flags");
+        }
     }
 }

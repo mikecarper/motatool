@@ -11,6 +11,22 @@ pub fn is_url(s: &str) -> bool {
 /// from Intel HEX into its flat binary; anything else is used verbatim. The nRF52 `firmware.hex` already
 /// carries the EndF trailer, so the flat image IS the OTA image.
 pub fn read_input(src: &str) -> Result<Vec<u8>> {
+    let raw = read_raw_input(src)?;
+    if src.to_ascii_lowercase().ends_with(".hex") {
+        parse_intel_hex(&raw).with_context(|| format!("parsing Intel HEX: {src}"))
+    } else {
+        Ok(raw)
+    }
+}
+
+/// Read an OTAFIX Intel HEX and extract its exact, padded Nordic bootloader-copy region.
+pub fn read_bootloader_hex(src: &str) -> Result<Vec<u8>> {
+    let raw = read_raw_input(src)?;
+    crate::bootloader::extract_bootloader_region_from_hex(&raw)
+        .with_context(|| format!("extracting OTAFIX bootloader region from Intel HEX: {src}"))
+}
+
+fn read_raw_input(src: &str) -> Result<Vec<u8>> {
     let raw = if is_url(src) {
         fetch_url(src).with_context(|| format!("downloading {src}"))?
     } else {
@@ -19,11 +35,7 @@ pub fn read_input(src: &str) -> Result<Vec<u8>> {
     if raw.is_empty() {
         bail!("input is empty: {src}");
     }
-    if src.to_ascii_lowercase().ends_with(".hex") {
-        parse_intel_hex(&raw).with_context(|| format!("parsing Intel HEX: {src}"))
-    } else {
-        Ok(raw)
-    }
+    Ok(raw)
 }
 
 fn fetch_url(url: &str) -> Result<Vec<u8>> {
