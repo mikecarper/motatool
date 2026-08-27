@@ -217,7 +217,18 @@ since been removed from the MeshCore tree in favour of this one; the shared cont
 any code dependency — MeshCore does not depend on motatool, nor motatool on MeshCore.
 
 `src/targets.rs` is a vendored snapshot of the firmware's generated `OtaTargets.h`
-(`target_id = sha2-256:4(env_name)`); regenerate it from there when the OTA-capable env set changes.
+(`target_id = sha2-256:4(env_name)`); regenerate it from there when the OTA-capable env set changes:
+
+```sh
+make sync-targets              # reads ../MeshCore/src/helpers/ota/OtaTargets.h
+make check-targets             # fails if the vendored table has drifted
+```
+
+Pass an explicit checkout when the repositories are not siblings:
+
+```sh
+python3 scripts/sync_meshcore_targets.py --header /path/to/MeshCore/src/helpers/ota/OtaTargets.h
+```
 
 ## Deltas
 

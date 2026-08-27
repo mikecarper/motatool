@@ -8,7 +8,7 @@
 PY ?= python3
 VENV := .venv
 
-.PHONY: build test dev-setup clean-venv
+.PHONY: build test dev-setup sync-targets check-targets clean-venv
 
 build:
 	cargo build --release
@@ -26,6 +26,13 @@ dev-setup:
 # exercise them (they assert apply-equivalence against the real detools decoder).
 test:
 	cargo test
+
+# Keep the human-readable OTA target labels synchronized with a sibling MeshCore checkout.
+sync-targets:
+	$(PY) scripts/sync_meshcore_targets.py
+
+check-targets:
+	$(PY) scripts/sync_meshcore_targets.py --check
 
 clean-venv:
 	rm -rf $(VENV)
