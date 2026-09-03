@@ -17,6 +17,11 @@ pub mod targets;
 pub mod transport;
 pub mod verify;
 
+pub use bootloader::{
+    bootloader_version_str, build_bootloader, validate_bootloader_image_for_profile,
+    validate_bootloader_inventory, BootloaderBoard, BootloaderBuildOpts, BootloaderCompatibility,
+    BootloaderIdentity, BOOTLOADER_BOARDS,
+};
 pub use build::{build, BuildOpts, Built};
 pub use encode::PatchType;
 pub use format::{Codec, FwIdent, Manifest};

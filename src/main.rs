@@ -2,16 +2,20 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use motatool::bootloader::{
+    bootloader_version_str, validate_bootloader_image, BootloaderBoard, BootloaderBuildOpts,
+    STORAGE_SD_UPDATE,
+};
 use motatool::crypto::{ed25519_keygen, load_key32};
 use motatool::endf::{pack_version, target_id_for_env, version_str};
 use motatool::format::DEFAULT_BLOCK_SIZE;
-use motatool::input::read_input;
+use motatool::input::{read_bootloader_hex, read_input};
 use motatool::serve::{
     attach_serial_folder, detach_serial_folder, open_serial, open_tcp, serve_loop, Folder,
     SeederCore,
 };
 use motatool::transport::deflate_transport_size;
-use motatool::{build, targets, verify, BuildOpts, Codec, Manifest, PatchType};
+use motatool::{build, build_bootloader, targets, verify, BuildOpts, Codec, Manifest, PatchType};
 
 #[derive(Clone, Copy, ValueEnum)]
 enum CliPatchType {
@@ -28,6 +32,71 @@ impl From<CliPatchType> for PatchType {
         }
     }
 }
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CliBootloaderBoard {
+    #[value(name = "xiao_nrf52840_ble", alias = "xiao-nrf52840-ble")]
+    XiaoNrf52840Ble,
+    #[value(name = "xiao_nrf52840_ble_sense", alias = "xiao-nrf52840-ble-sense")]
+    XiaoNrf52840BleSense,
+    #[value(name = "heltec_mesh_tower_v2")]
+    HeltecMeshTowerV2,
+    #[value(name = "heltec_mesh_tower_v2_sdcard")]
+    HeltecMeshTowerV2Sdcard,
+    #[value(name = "heltec_mesh_pocket")]
+    HeltecMeshPocket,
+    #[value(name = "heltec_t096")]
+    HeltecT096,
+    #[value(name = "heltec_t1")]
+    HeltecT1,
+    #[value(name = "heltec_t114")]
+    HeltecT114,
+    #[value(name = "keepteen_lt1")]
+    KeepteenLt1,
+    #[value(name = "minewsemi_mx25le01")]
+    MinewsemiMx25le01,
+    #[value(name = "promicro_nrf52840")]
+    PromicroNrf52840,
+    #[value(name = "t1000_e")]
+    T1000E,
+    #[value(name = "thinknode_m3")]
+    ThinknodeM3,
+    #[value(name = "wiscore_rak3401")]
+    WiscoreRak3401,
+    #[value(name = "wiscore_rak4631_board")]
+    WiscoreRak4631Board,
+    #[value(name = "wismesh_tag")]
+    WismeshTag,
+}
+
+impl CliBootloaderBoard {
+    fn profile(self) -> (BootloaderBoard, u8) {
+        let board = match self {
+            Self::XiaoNrf52840Ble => BootloaderBoard::XiaoNrf52840Ble,
+            Self::XiaoNrf52840BleSense => BootloaderBoard::XiaoNrf52840BleSense,
+            Self::HeltecMeshTowerV2 | Self::HeltecMeshTowerV2Sdcard => {
+                BootloaderBoard::HeltecMeshTowerV2
+            }
+            Self::HeltecMeshPocket => BootloaderBoard::HeltecMeshPocket,
+            Self::HeltecT096 => BootloaderBoard::HeltecT096,
+            Self::HeltecT1 => BootloaderBoard::HeltecT1,
+            Self::HeltecT114 => BootloaderBoard::HeltecT114,
+            Self::KeepteenLt1 => BootloaderBoard::KeepteenLt1,
+            Self::MinewsemiMx25le01 => BootloaderBoard::MinewsemiMx25le01,
+            Self::PromicroNrf52840 => BootloaderBoard::PromicroNrf52840,
+            Self::T1000E => BootloaderBoard::T1000E,
+            Self::ThinknodeM3 => BootloaderBoard::ThinknodeM3,
+            Self::WiscoreRak3401 => BootloaderBoard::WiscoreRak3401,
+            Self::WiscoreRak4631Board => BootloaderBoard::WiscoreRak4631Board,
+            Self::WismeshTag => BootloaderBoard::WismeshTag,
+        };
+        let storage = match self {
+            Self::HeltecMeshTowerV2Sdcard => STORAGE_SD_UPDATE,
+            _ => board.storage_profile(),
+        };
+        (board, storage)
+    }
+}
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
@@ -38,9 +107,9 @@ use std::sync::Arc;
     name = "motatool",
     version,
     about = "Build, verify, inspect, and serve MeshCore .mota firmware-update containers.",
-    long_about = "A .mota is a signed, self-verifying package of a firmware update that MeshCore nodes \
-                  fetch over LoRa, block by block. This tool makes those packages, checks them, and (soon) \
-                  serves a folder of them to a node."
+    long_about = "A .mota is a self-verifying firmware-update package that MeshCore nodes fetch over \
+                  LoRa, block by block. This tool builds full and delta application packages plus signed \
+                  OTAFIX bootloader packages, verifies and inspects them, and serves a folder to a node."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -49,8 +118,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Package a firmware as a .mota (a full image; delta support is coming).
+    /// Package firmware as a full or delta application .mota.
     Build(BuildArgs),
+    /// Package an exact-board OTAFIX nRF52840 bootloader as a signed v3 .mota.
+    BuildBootloader(BuildBootloaderArgs),
     /// Validate .mota files (block hashes, merkle root, image hash, signature).
     Verify(VerifyArgs),
     /// Print every field of a .mota's manifest.
@@ -61,6 +132,28 @@ enum Command {
     Serve(ServeArgs),
     /// Measure exact per-block transport-DEFLATE sizes for a raw mOTA payload.
     TransportSize(TransportSizeArgs),
+}
+
+#[derive(Args)]
+struct BuildBootloaderArgs {
+    /// OTAFIX Intel HEX input. Only the 0xF4000..0xFE000 bootloader region is used.
+    #[arg(long)]
+    fw: String,
+    /// Exact OTAFIX board and storage profile.
+    #[arg(long, value_enum)]
+    board: CliBootloaderBoard,
+    /// Ed25519 private signing key. Bootloader packages cannot be unsigned.
+    #[arg(long)]
+    sign: String,
+    /// Optional four-byte version assertion. The embedded BLM2 version remains authoritative.
+    #[arg(long = "fw-version")]
+    fw_version: Option<String>,
+    /// Output directory used when --out is omitted.
+    #[arg(long = "out-dir", default_value = ".")]
+    out_dir: String,
+    /// Exact output path.
+    #[arg(long)]
+    out: Option<String>,
 }
 
 #[derive(Args)]
@@ -154,6 +247,9 @@ struct ServeArgs {
     /// (serial only) don't auto-send `ota folder on`/`off` on the node's console.
     #[arg(long = "no-enable")]
     no_enable: bool,
+    /// Deprecated compatibility no-op; terminal entry is now automatic.
+    #[arg(long = "companion-terminal", requires = "serial")]
+    _companion_terminal: bool,
     /// Warm-start: stage this similar build's payload into each captured .part (for `ota pull … validate`).
     #[arg(long)]
     seed: Option<String>,
@@ -176,6 +272,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Build(a) => cmd_build(a),
+        Command::BuildBootloader(a) => cmd_build_bootloader(a),
         Command::Verify(a) => return cmd_verify(a),
         Command::Inspect(a) => cmd_inspect(a),
         Command::Keygen(a) => cmd_keygen(a),
@@ -310,6 +407,88 @@ fn cmd_build(a: BuildArgs) -> Result<()> {
     Ok(())
 }
 
+fn cmd_build_bootloader(a: BuildBootloaderArgs) -> Result<()> {
+    let (board, storage_profile) = a.board.profile();
+    let image = read_bootloader_hex(&a.fw)?;
+    let sign_seed = load_key32(&a.sign).context("--sign")?;
+    let built = build_bootloader(&BootloaderBuildOpts {
+        image,
+        board,
+        storage_profile,
+        sign_seed,
+    })?;
+
+    if let Some(asserted) = &a.fw_version {
+        let asserted = pack_version(asserted).context("--fw-version")?;
+        if asserted != built.manifest.fw_version {
+            bail!(
+                "--fw-version {} does not match embedded bootloader version {}",
+                bootloader_version_str(asserted),
+                bootloader_version_str(built.manifest.fw_version)
+            );
+        }
+    }
+    let problems = verify(&built.bytes);
+    if !problems.is_empty() {
+        bail!(
+            "internal error: built bootloader .mota fails verification: {}",
+            problems.join("; ")
+        );
+    }
+
+    let out_path = match &a.out {
+        Some(path) => {
+            if let Some(parent) = Path::new(path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+            }
+            path.clone()
+        }
+        None => {
+            std::fs::create_dir_all(&a.out_dir).ok();
+            Path::new(&a.out_dir)
+                .join(&built.suggested_name)
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    std::fs::write(&out_path, &built.bytes).with_context(|| format!("cannot write {out_path}"))?;
+
+    let manifest = &built.manifest;
+    let payload = &built.bytes
+        [manifest.payload_off()..manifest.payload_off() + manifest.payload_size as usize];
+    let identity = validate_bootloader_image(
+        payload,
+        manifest.target_id,
+        &manifest.hw_id,
+        manifest.fw_version,
+    )?;
+    println!("wrote {out_path}");
+    println!(
+        "  bootloader  board={}  target={:08X}  v{}  signed",
+        board.profile_name(storage_profile).unwrap_or(board.name()),
+        manifest.target_id,
+        bootloader_version_str(manifest.fw_version)
+    );
+    println!(
+        "  region=0x{start:08X}..0x{end:08X}  image={}B  blocks={}  total={}B",
+        manifest.image_size,
+        manifest.block_count,
+        built.bytes.len(),
+        start = motatool::bootloader::IMAGE_START,
+        end = motatool::bootloader::IMAGE_START + motatool::bootloader::IMAGE_SIZE as u32
+    );
+    println!(
+        "  continuity=S{} FWID=0x{:04X} app_base=0x{:08X} layout_abi={}",
+        identity.softdevice_family,
+        identity.softdevice_fwid,
+        identity.app_base,
+        identity.layout_abi
+    );
+    Ok(())
+}
+
 fn cmd_verify(a: VerifyArgs) -> ExitCode {
     let expect_pub = match a.pub_key.as_deref().map(load_key32).transpose() {
         Ok(p) => p,
@@ -345,8 +524,8 @@ fn cmd_verify(a: VerifyArgs) -> ExitCode {
                 "OK    {file} : {} target={:08X} [{}] v{} hw={} {} blocks={} size={}",
                 kind_label(m),
                 m.target_id,
-                targets::label(m.target_id),
-                version_str(m.fw_version),
+                package_target_label(m, &blob),
+                package_version_str(m),
                 if m.hw_id_str().is_empty() {
                     "?".into()
                 } else {
@@ -376,6 +555,7 @@ fn cmd_inspect(a: InspectArgs) -> Result<()> {
 
     let codec = m.codec().map(Codec::label).unwrap_or("?");
     println!("total_size     : {}", blob.len());
+    println!("package_kind   : {}", kind_label(&m));
     println!("format_ver     : {}", m.format_ver);
     println!(
         "flags          : 0x{:02x}  FULL={} SIGNED={} BOOTLOADER={}",
@@ -388,11 +568,11 @@ fn cmd_inspect(a: InspectArgs) -> Result<()> {
     println!(
         "target_id      : 0x{:08x}  ({})",
         m.target_id,
-        targets::label(m.target_id)
+        package_target_label(&m, &blob)
     );
     println!(
         "fw_version     : {}  (0x{:08x})",
-        version_str(m.fw_version),
+        package_version_str(&m),
         m.fw_version
     );
     println!("image_size     : {}", m.image_size);
@@ -434,8 +614,21 @@ fn cmd_inspect(a: InspectArgs) -> Result<()> {
             &m.hw_id,
             m.fw_version,
         )?;
+        let board = BootloaderBoard::from_identity(identity.board_id, &identity.device_name);
+        println!(
+            "bootloader_profile: {}",
+            board
+                .and_then(|value| value.profile_name(identity.storage_flags))
+                .unwrap_or("unsupported")
+        );
+        println!("bootloader_offset: 0x{:04x}", identity.manifest_offset);
         println!("bootloader_board: 0x{:08x}", identity.board_id);
         println!("bootloader_name : {}", identity.device_name);
+        println!(
+            "bootloader_version: {}  (0x{:08x})",
+            bootloader_version_str(identity.boot_version),
+            identity.boot_version
+        );
         println!(
             "bootloader_cont : S{} fwid=0x{:04x} app=0x{:x} ABI{}",
             identity.softdevice_family,
@@ -490,8 +683,8 @@ fn cmd_serve(a: ServeArgs) -> Result<()> {
             s.path.file_name().unwrap_or_default().to_string_lossy(),
             hex::encode_upper(m.merkle_root),
             m.target_id,
-            targets::label(m.target_id),
-            version_str(m.fw_version),
+            package_target_label(m, &s.bytes),
+            package_version_str(m),
             if m.is_bootloader() {
                 "bootloader"
             } else {
@@ -587,4 +780,31 @@ fn kind_label(m: &Manifest) -> &'static str {
         Some(Codec::DetoolsInplace) => "in-place delta",
         _ => "sequential delta",
     }
+}
+
+fn package_version_str(m: &Manifest) -> String {
+    if m.is_bootloader() {
+        bootloader_version_str(m.fw_version)
+    } else {
+        version_str(m.fw_version)
+    }
+}
+
+fn package_target_label(m: &Manifest, blob: &[u8]) -> &'static str {
+    if !m.is_bootloader() {
+        return targets::label(m.target_id);
+    }
+    let Some(payload_end) = m.payload_off().checked_add(m.payload_size as usize) else {
+        return "unsupported bootloader";
+    };
+    let Some(payload) = blob.get(m.payload_off()..payload_end) else {
+        return "unsupported bootloader";
+    };
+    let Ok(identity) = validate_bootloader_image(payload, m.target_id, &m.hw_id, m.fw_version)
+    else {
+        return "unsupported bootloader";
+    };
+    BootloaderBoard::from_identity(identity.board_id, &identity.device_name)
+        .and_then(|board| board.profile_name(identity.storage_flags))
+        .unwrap_or("unsupported bootloader")
 }

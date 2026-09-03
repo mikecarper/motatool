@@ -1,7 +1,7 @@
 //! The `EndF` firmware-identity trailer and version/target helpers.
 //!
-//! A firmware image self-describes via a fixed 56-byte trailer the build appends: `EndF ‖ body_len(4) ‖
-//! body_hash8(8) ‖ fw_version(4) ‖ target_id(4) ‖ hw_id(32)`. `build` reads identity from here (overridable
+//! A firmware image self-describes via a fixed 56-byte trailer the build appends: `EndF || body_len(4) ||
+//! body_hash8(8) || fw_version(4) || target_id(4) || hw_id(32)`. `build` reads identity from here (overridable
 //! by flags) so a `.mota` inherits the firmware's own target/version/hardware without a filename convention.
 
 use crate::crypto::mh;
@@ -195,7 +195,7 @@ pub fn parse_ident(image: &[u8]) -> FwIdent {
     }
 }
 
-/// Append a 56-byte EndF trailer carrying `ident` if `image` has none (idempotent — a trailed image is
+/// Append a 56-byte EndF trailer carrying `ident` if `image` has none (idempotent - a trailed image is
 /// returned unchanged). Returns the image and its 8-byte body hash.
 pub fn ensure_endf(image: &[u8], ident: &FwIdent) -> (Vec<u8>, [u8; 8]) {
     if has_endf(image) {
@@ -223,36 +223,47 @@ pub fn target_id_for_env(env: &str) -> u32 {
     rd_u32(&mh::<4>(env.as_bytes()), 0)
 }
 
-/// Pack `"a.b.c[.d]"` into a u32 (each dotted part clamped to a byte: `a<<24 | b<<16 | c<<8 | d`).
+/// Pack `"a.b.c[.d]"` into a u32 (`a<<24 | b<<16 | c<<8 | d`). Every component must fit one byte;
+/// extra components are rejected instead of being silently truncated.
 pub fn pack_version(s: &str) -> Result<u32> {
     let mut parts = [0u32; 4];
     let mut n = 0;
-    for tok in s.split('.').take(4) {
+    for tok in s.split('.') {
+        if n == parts.len() {
+            bail!("too many version components: {s:?}");
+        }
         if tok.is_empty() || !tok.bytes().all(|b| b.is_ascii_digit()) {
             bail!("bad version: {s:?}");
         }
-        parts[n] = tok
+        let value: u32 = tok
             .parse()
             .map_err(|_| anyhow::anyhow!("version component too large: {s:?}"))?;
+        if value > u8::MAX as u32 {
+            bail!("version component exceeds 255: {s:?}");
+        }
+        parts[n] = value;
         n += 1;
     }
     if n == 0 {
         bail!("bad version: {s:?}");
     }
-    Ok(((parts[0] & 0xFF) << 24)
-        | ((parts[1] & 0xFF) << 16)
-        | ((parts[2] & 0xFF) << 8)
-        | (parts[3] & 0xFF))
+    Ok((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3])
 }
 
-/// Render the packed version as `"major.minor.patch"` (the prerelease byte is not shown).
+/// Render the packed version, including a nonzero fourth byte.
 pub fn version_str(v: u32) -> String {
-    format!(
+    let core = format!(
         "{}.{}.{}",
         (v >> 24) & 0xFF,
         (v >> 16) & 0xFF,
         (v >> 8) & 0xFF
-    )
+    );
+    let fourth = v & 0xFF;
+    if fourth == 0 {
+        core
+    } else {
+        format!("{core}.{fourth}")
+    }
 }
 
 #[cfg(test)]
@@ -263,9 +274,13 @@ mod tests {
     fn version_roundtrip() {
         assert_eq!(pack_version("1.17.0").unwrap(), 0x0111_0000);
         assert_eq!(version_str(0x0111_0000), "1.17.0");
+        assert_eq!(pack_version("1.17.1.02").unwrap(), 0x0111_0102);
+        assert_eq!(version_str(0x0111_0102), "1.17.1.2");
         assert!(pack_version("1..2").is_err());
         assert!(pack_version("").is_err());
         assert!(pack_version("1.2.x").is_err());
+        assert!(pack_version("256.2.3").is_err());
+        assert!(pack_version("1.2.3.4.5").is_err());
     }
 
     #[test]
