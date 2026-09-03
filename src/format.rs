@@ -28,7 +28,14 @@ pub const APPROVAL_YES: [u8; 4] = *b"APRV";
 pub const MFL: usize = 197; // manifest-minus-leaves length (constant)
 pub const SIGNED_LEN: usize = 129; // the Ed25519 signature covers manifest[0, 129)
 pub const HW_ID_LEN: usize = 32;
-pub const DEFAULT_BLOCK_SIZE: u32 = 1024;
+/// Default logical block size for application (format-2) containers.
+///
+/// The strict bootloader (format-3) profile remains fixed at 1024 bytes.
+pub const DEFAULT_BLOCK_SIZE: u32 = 2048;
+/// Largest logical block accepted for application (format-2) containers.
+pub const MAX_APPLICATION_BLOCK_SIZE: u32 = 2048;
+/// Fixed logical block size required by the bootloader (format-3) profile.
+pub const BOOTLOADER_BLOCK_SIZE: u32 = 1024;
 
 /// Manifest field offsets, relative to the manifest start (= [`HEADER_LEN`]).
 pub mod off {
@@ -262,10 +269,21 @@ impl Manifest {
 
         let block_size_log2 = mf[off::BLOCK_SIZE_LOG2];
         let payload_size = rd_u32(mf, off::PAYLOAD_SIZE);
-        ensure!(
-            (1..=24).contains(&block_size_log2) && payload_size != 0,
-            "bad block_size/payload"
-        );
+        ensure!(payload_size != 0, "bad block_size/payload");
+        match format_ver {
+            APP_FORMAT_VER => {
+                ensure!(block_size_log2 >= 1, "bad block_size/payload");
+                ensure!(
+                    block_size_log2 <= MAX_APPLICATION_BLOCK_SIZE.ilog2() as u8,
+                    "v2 application block size must be at most {MAX_APPLICATION_BLOCK_SIZE} bytes"
+                );
+            }
+            BOOT_FORMAT_VER => ensure!(
+                block_size_log2 == BOOTLOADER_BLOCK_SIZE.ilog2() as u8,
+                "v3 bootloader manifest requires 1 KiB blocks"
+            ),
+            _ => unreachable!("format version was validated above"),
+        }
         let block_size = 1u32 << block_size_log2;
         let block_count = payload_size.div_ceil(block_size);
         ensure!(
@@ -303,7 +321,7 @@ impl Manifest {
                     && m.codec_id == Codec::Full as u8
                     && m.image_size as usize == crate::bootloader::IMAGE_SIZE
                     && m.payload_size as usize == crate::bootloader::IMAGE_SIZE
-                    && m.block_size_log2 == 10
+                    && m.block_size() == BOOTLOADER_BLOCK_SIZE
                     && m.block_count == 40
                     && m.base_hash == [0u8; 8],
                 "v3 bootloader manifest geometry/identity is invalid"

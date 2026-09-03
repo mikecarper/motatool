@@ -18,6 +18,7 @@ to live in the MeshCore tree, kept **byte-for-byte compatible** with the firmwar
 | `inspect` | ✅ manifest fields + embedded v3 bootloader identity/capabilities |
 | `keygen` | ✅ Ed25519 signing keypair |
 | `serve` (USB serial + WiFi TCP) | ✅ folder relay + pull-to-folder capture + `--seed` warm-start — see [Serve](#serve) |
+| `transport-size` | ✅ exact 171-byte-packet estimate using the live DEFLATE encoder |
 
 The full feature set of the old C++ tool, plus pure-Rust delta encoding (which the C++ tool never had).
 
@@ -40,6 +41,7 @@ tests skip cleanly.
 motatool build --fw firmware.hex --out-dir ./motas
 motatool build --fw firmware.bin --sign signer.key --out-dir ./motas   # signed
 motatool build --fw https://example.org/RAK_4631_repeater.bin          # straight from a URL
+motatool transport-size --payload update.patch                         # 2 KiB DEFLATE blocks by default
 
 # check containers (per-file OK / FAIL; non-zero exit if any fails)
 motatool verify ./motas/*.mota
@@ -84,12 +86,19 @@ leaves and pulls only the **differing** blocks over LoRa — a byte-exact captur
 slow transfer. Other flags: `--baud` (serial speed), `--no-recursive` (don't descend into sub-folders),
 `--no-enable` (don't auto-send `ota folder on`/`off` on the serial console), `-v` (log each request).
 
-Newer nodes can also request a logical 1 KiB payload block as an independent raw RFC 1951 DEFLATE stream.
+Newer nodes can also request a logical 2 KiB payload block as an independent raw RFC 1951 DEFLATE stream.
 The host does the compression, so the embedded seeder carries no encoder; blocks which do not shrink
 automatically use the negotiated 171-byte raw DATA profile. OTA-capable receiver firmware accepts stored,
-fixed-Huffman, and dynamic-Huffman DEFLATE blocks. Older nodes continue to use `READ` unchanged.
+fixed-Huffman, and dynamic-Huffman DEFLATE blocks. Older nodes continue to use `READ` with legacy 1 KiB
+containers; packages intended to start on those receivers must still be built with `--block-size 1024`.
 Support is advertised in the existing descriptor's reserved capability byte, so newer firmware does not
 wait on operation `0x09` when connected to an older host daemon.
+
+New application containers use 2 KiB payload/Merkle blocks by default, reducing leaf-table overhead and
+giving DEFLATE a larger independent compression window. Existing format-2 containers with 1 KiB blocks
+remain valid and can still be verified, inspected, and served; pass `build --block-size 1024` when creating
+one deliberately. The strict format-3 bootloader profile is unchanged and continues to require exactly
+40 one-KiB blocks.
 
 On serial links, `serve` asserts DTR/RTS, lets USB CDC settle, and waits for the node to confirm that its
 folder source attached. A command lost during port-open is retried a bounded number of times; once binary

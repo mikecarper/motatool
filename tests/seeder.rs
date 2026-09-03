@@ -19,7 +19,7 @@ fn a_mota() -> Vec<u8> {
         fw_version: Some(0x0111_0000),
         hw_id: Some("RAK4631".into()),
         sign_seed: None,
-        block_size: 1024,
+        block_size: 2048,
         force: false,
     })
     .unwrap()
@@ -50,7 +50,7 @@ fn serve_ops_count_describe_read() {
     assert_eq!(st, STATUS_OK);
     assert_eq!(desc.len(), DESC_WIRE);
     assert_eq!(&desc[0..4], &mota[HEADER_LEN + 20..HEADER_LEN + 24]); // mid == manifest merkle_root
-    assert_eq!(desc[34], 10); // block_size_log2
+    assert_eq!(desc[34], 11); // block_size_log2
     assert_eq!(desc[35], SOURCE_CAP_DEFLATE_BLOCK);
 
     assert_eq!(core.handle(OP_DESCRIBE, &[9]).unwrap().0, STATUS_ERR); // out of range
@@ -87,7 +87,7 @@ fn serves_independent_raw_deflate_blocks_in_bounded_slices() {
     assert_eq!(status, STATUS_OK);
     assert_eq!(size_reply.len(), 2);
     let encoded_len = u16::from_le_bytes(size_reply.try_into().unwrap()) as usize;
-    assert!(encoded_len < 1024);
+    assert!(encoded_len < 2048);
 
     let mut encoded = Vec::with_capacity(encoded_len);
     while encoded.len() < encoded_len {
@@ -108,7 +108,7 @@ fn serves_independent_raw_deflate_blocks_in_bounded_slices() {
         .unwrap();
     assert_eq!(
         decoded,
-        mota[manifest.payload_off()..manifest.payload_off() + 1024]
+        mota[manifest.payload_off()..manifest.payload_off() + 2048]
     );
 
     assert_eq!(request(0, 0, (DEFLATE_READ_MAX + 1) as u16).0, STATUS_ERR);

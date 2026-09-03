@@ -55,6 +55,13 @@ struct DeltaBuilt {
 }
 
 pub fn build(o: &BuildOpts) -> Result<Built> {
+    ensure!(
+        o.block_size > 1
+            && o.block_size <= MAX_APPLICATION_BLOCK_SIZE
+            && o.block_size.is_power_of_two(),
+        "application block size must be a power of two between 2 and {MAX_APPLICATION_BLOCK_SIZE} bytes"
+    );
+
     // Resolve identity: explicit flags win over the firmware's self-describing EndF trailer.
     let from_fw = parse_ident(&o.fw);
     let ident = FwIdent {
@@ -354,7 +361,7 @@ fn validate_staging_fit(plan: InplacePlan, total: usize) -> Result<()> {
     Ok(())
 }
 
-/// log2 of a power-of-two block size (1024 → 10).
+/// log2 of a power-of-two block size (2048 → 11).
 fn block_size_log2(bs: u32) -> u8 {
     (u32::BITS - 1 - bs.max(1).leading_zeros()) as u8
 }

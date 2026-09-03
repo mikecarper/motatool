@@ -7,8 +7,9 @@ use motatool::bootloader::{
 };
 use motatool::crypto::{ed25519_keygen, ed25519_sign, sha256};
 use motatool::format::{
-    off, seeder, wr_u32, APPROVAL_NONE, APP_FORMAT_VER, BOOT_FORMAT_VER, HASH_ALGO_SHA256,
-    HEADER_LEN, MAGIC, MFL, MFLAG_BOOTLOADER, MFLAG_FULL, MFLAG_SIGNED, SIGNED_LEN, TRAILER,
+    off, seeder, wr_u32, APPROVAL_NONE, APP_FORMAT_VER, BOOTLOADER_BLOCK_SIZE, BOOT_FORMAT_VER,
+    HASH_ALGO_SHA256, HEADER_LEN, MAGIC, MFL, MFLAG_BOOTLOADER, MFLAG_FULL, MFLAG_SIGNED,
+    SIGNED_LEN, TRAILER,
 };
 use motatool::merkle;
 use motatool::serve::{Folder, SeederCore};
@@ -83,7 +84,7 @@ fn ieee_crc32(bytes: &[u8]) -> u32 {
 fn noop(_: &mut [u8]) {}
 
 fn bootloader_container(image: &[u8], mutate_manifest: fn(&mut [u8])) -> Vec<u8> {
-    let leaves = merkle::leaf_hashes(image, 1024);
+    let leaves = merkle::leaf_hashes(image, BOOTLOADER_BLOCK_SIZE as usize);
     assert_eq!(leaves.len(), 40);
     let mut manifest = [0u8; MFL];
     manifest[off::FORMAT_VER] = BOOT_FORMAT_VER;
@@ -97,7 +98,7 @@ fn bootloader_container(image: &[u8], mutate_manifest: fn(&mut [u8])) -> Vec<u8>
     wr_u32(&mut manifest, off::FW_VERSION, BOOT_VERSION);
     wr_u32(&mut manifest, off::IMAGE_SIZE, IMAGE_SIZE as u32);
     wr_u32(&mut manifest, off::PAYLOAD_SIZE, IMAGE_SIZE as u32);
-    manifest[off::BLOCK_SIZE_LOG2] = 10;
+    manifest[off::BLOCK_SIZE_LOG2] = BOOTLOADER_BLOCK_SIZE.ilog2() as u8;
     manifest[off::MERKLE_ROOT..off::MERKLE_ROOT + 4].copy_from_slice(&merkle::root(&leaves));
     manifest[off::IMAGE_HASH..off::IMAGE_HASH + 32].copy_from_slice(&sha256(image));
     manifest[off::CODEC_ID] = 0;
@@ -177,6 +178,9 @@ fn v3_wrong_hash(m: &mut [u8]) {
 fn v3_wrong_codec(m: &mut [u8]) {
     m[off::CODEC_ID] = 2;
 }
+fn v3_wrong_block_size(m: &mut [u8]) {
+    m[off::BLOCK_SIZE_LOG2] = 11;
+}
 fn v3_nonzero_base(m: &mut [u8]) {
     m[off::BASE_HASH] = 1;
 }
@@ -199,6 +203,7 @@ fn v3_outer_profile_is_exact_and_identity_bound() {
         ("non-exact flags", v3_without_exact_flags),
         ("hash algorithm", v3_wrong_hash),
         ("codec", v3_wrong_codec),
+        ("2 KiB block size", v3_wrong_block_size),
         ("base hash", v3_nonzero_base),
         ("version sentinel", v3_bad_version),
         ("target binding", v3_wrong_target),

@@ -5,7 +5,7 @@
 //! reply — a future BLE/GATT path would call it directly) and a byte-stream [`serve_loop`] that frames it.
 
 use crate::format::{rd_u32, seeder, Manifest, HEADER_LEN, MAGIC, MFL};
-use crate::transport::deflate_raw;
+use crate::transport::{deflate_raw, MAX_TRANSPORT_BLOCK_SIZE};
 use crate::verify::verify;
 use anyhow::{bail, Context, Result};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
@@ -164,9 +164,9 @@ impl SeederCore {
             return (STATUS_ERR, vec![]);
         }
         let block_size = served.manifest.block_size() as usize;
-        // MeshCore's radio descriptor and receiver accept logical blocks only through 1 KiB. Reject a
+        // MeshCore's radio descriptor and receiver accept logical blocks only through 2 KiB. Reject a
         // syntactically valid larger-container geometry before allocating/compressing attacker-sized input.
-        if block_size == 0 || block_size > 1024 {
+        if block_size == 0 || block_size > MAX_TRANSPORT_BLOCK_SIZE {
             return (STATUS_ERR, vec![]);
         }
         let payload_start = served.manifest.payload_off();

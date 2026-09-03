@@ -1,6 +1,7 @@
 //! The MeshCore payload merkle tree.
 //!
-//! Each 1 KB payload block hashes to a 4-byte leaf (`sha2-256:4`); the root is a Merkle-Mountain-Range:
+//! Each payload block (2 KiB by default for new application containers) hashes to a 4-byte leaf
+//! (`sha2-256:4`); the root is a Merkle-Mountain-Range:
 //! leaves are folded into per-level "peaks" like incrementing a binary counter (carry = combine two equal
 //! subtrees), then the leftover peaks are bagged **right-to-left** into the final 4-byte root. This must
 //! stay byte-identical to `src/helpers/ota/MerkleTree.cpp` in the firmware — the device recomputes the same

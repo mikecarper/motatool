@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use motatool::crypto::{ed25519_keygen, load_key32};
 use motatool::endf::{pack_version, target_id_for_env, version_str};
+use motatool::format::DEFAULT_BLOCK_SIZE;
 use motatool::input::read_input;
 use motatool::serve::{
     attach_serial_folder, open_serial, open_tcp, serve_loop, Folder, SeederCore,
@@ -96,8 +97,8 @@ struct BuildArgs {
     /// Ed25519 private key (hex or raw 32 bytes, from `keygen`) to sign the container.
     #[arg(long)]
     sign: Option<String>,
-    /// Payload block size (default 1024).
-    #[arg(long = "block-size", default_value_t = 1024)]
+    /// Application payload/Merkle block size (default 2048; legacy 1024 remains supported).
+    #[arg(long = "block-size", default_value_t = DEFAULT_BLOCK_SIZE)]
     block_size: u32,
     /// Build the delta even across differing hardware identity (delta only).
     #[arg(long)]
@@ -166,8 +167,8 @@ struct TransportSizeArgs {
     /// Raw mOTA payload (for a delta, the generated patch bytes).
     #[arg(long)]
     payload: PathBuf,
-    /// Logical payload block size; MeshCore radio OTA supports at most 1024.
-    #[arg(long = "block-size", default_value_t = 1024)]
+    /// Logical payload block size; MeshCore application radio OTA supports at most 2048.
+    #[arg(long = "block-size", default_value_t = DEFAULT_BLOCK_SIZE as usize)]
     block_size: usize,
 }
 

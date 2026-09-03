@@ -5,18 +5,16 @@ use std::process::Command;
 fn transport_size_cli_reports_the_shared_live_encoder_measurement() {
     let directory = tempfile::tempdir().unwrap();
     let payload_path = directory.path().join("payload.patch");
-    let mut payload = vec![0u8; 1024];
+    let mut payload = vec![0u8; 2048];
     payload.extend_from_slice(b"short");
     std::fs::write(&payload_path, &payload).unwrap();
 
-    let expected = deflate_transport_size(&payload, 1024).unwrap();
+    let expected = deflate_transport_size(&payload, 2048).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_motatool"))
         .args([
             "transport-size",
             "--payload",
             payload_path.to_str().unwrap(),
-            "--block-size",
-            "1024",
         ])
         .output()
         .unwrap();
@@ -36,4 +34,16 @@ fn transport_size_cli_reports_the_shared_live_encoder_measurement() {
         String::from_utf8(output.stdout).unwrap().trim(),
         expected_json
     );
+}
+
+#[test]
+fn transport_size_help_documents_the_2k_default() {
+    let output = Command::new(env!("CARGO_BIN_EXE_motatool"))
+        .args(["transport-size", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("at most 2048"), "{stdout}");
+    assert!(stdout.contains("[default: 2048]"), "{stdout}");
 }
