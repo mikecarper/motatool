@@ -13,7 +13,7 @@ fn a_mota() -> Vec<u8> {
         fw: (0..3000u32).map(|i| i as u8).collect(),
         base: None,
         patch_type: motatool::PatchType::Sequential,
-        inplace_memory: 0,
+        inplace_memory: None,
         segment_size: 0,
         target_id: Some(0x04D4_13FD),
         fw_version: Some(0x0111_0000),
@@ -50,7 +50,7 @@ fn serve_ops_count_describe_read() {
     assert_eq!(st, STATUS_OK);
     assert_eq!(desc.len(), DESC_WIRE);
     assert_eq!(&desc[0..4], &mota[HEADER_LEN + 20..HEADER_LEN + 24]); // mid == manifest merkle_root
-    assert_eq!(desc[34], 10);
+    assert_eq!(desc[34], 10); // block_size_log2
     assert_eq!(desc[35], SOURCE_CAP_DEFLATE_BLOCK);
 
     assert_eq!(core.handle(OP_DESCRIBE, &[9]).unwrap().0, STATUS_ERR); // out of range

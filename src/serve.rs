@@ -6,15 +6,21 @@
 
 use crate::format::{rd_u32, seeder, Manifest, HEADER_LEN, MAGIC, MFL};
 use crate::verify::verify;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use flate2::{write::DeflateEncoder, Compression};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 const LINK_TIMEOUT: Duration = Duration::from_millis(500);
+const SERIAL_OPEN_SETTLE: Duration = Duration::from_millis(750);
+const ATTACH_RETRY_AFTER: Duration = Duration::from_secs(2);
+const ATTACH_TIMEOUT: Duration = Duration::from_secs(12);
+const ATTACH_MAX_ATTEMPTS: usize = 3;
+const FOLDER_ON: &[u8] = b"ota folder on\r\n";
 
 // ---- served folder -------------------------------------------------------------------------------
 
@@ -262,7 +268,9 @@ impl SeederCore {
     fn publish(&self, part: &Path, done: &Path) -> std::io::Result<()> {
         let size = std::fs::metadata(part)?.len();
         let mut head = [0u8; 8];
-        std::fs::File::open(part)?.read_exact(&mut head)?;
+        let mut file = std::fs::File::open(part)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.read_exact(&mut head)?;
         if head[..4] != MAGIC || rd_u32(&head, 4) as u64 != size {
             return Err(std::io::Error::new(
                 ErrorKind::InvalidData,
@@ -282,7 +290,7 @@ fn deflate_raw(input: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// MotaDesc wire (38 B): mid[4] target(4) fwver(4) codec(1) flags(1) total(4) leaves_off(4) block_count(4)
-/// payload_off(4) payload_size(4) block_log2(1) source_caps(1) reserved(2).
+/// payload_off(4) payload_size(4) block_size_log2(1) source_caps(1) reserved(2).
 fn describe(s: &ServedMota) -> [u8; seeder::DESC_WIRE] {
     let m = &s.manifest;
     let mut w = [0u8; seeder::DESC_WIRE];
@@ -329,10 +337,19 @@ impl<T: Read + Write> Link for T {}
 
 /// Open the node's USB serial port at `baud` (raw, no flow control), with a read timeout.
 pub fn open_serial(dev: &str, baud: u32) -> Result<Box<dyn Link>> {
-    let port = serialport::new(dev, baud)
+    let mut port = serialport::new(dev, baud)
         .timeout(LINK_TIMEOUT)
+        // Windows preserves DTR low by default. MeshCore's native USB CDC console does not reliably
+        // consume the first command until the host has asserted its terminal-control lines.
+        .dtr_on_open(true)
         .open()
         .with_context(|| format!("cannot open serial device: {dev}"))?;
+    // The builder applies DTR best-effort, so assert both lines once more and surface a real failure.
+    // RTS is held (not pulsed); this matches normal terminal clients and does not enable flow control.
+    port.write_data_terminal_ready(true)
+        .with_context(|| format!("cannot assert DTR on serial device: {dev}"))?;
+    port.write_request_to_send(true)
+        .with_context(|| format!("cannot assert RTS on serial device: {dev}"))?;
     Ok(Box::new(port))
 }
 
@@ -351,6 +368,22 @@ enum Byte {
     Got(u8),
     Timeout,
     Closed,
+}
+
+#[derive(Default)]
+struct StreamState {
+    // Only an `M` needs delaying: it may be the first byte of the binary `MS` request magic.
+    pending_m: bool,
+    deferred: Option<u8>,
+    line: String,
+}
+
+enum PumpEvent {
+    Activity,
+    Timeout,
+    Closed,
+    SeederFrame(Option<String>),
+    DeviceLine(String),
 }
 
 fn read_byte(link: &mut dyn Link) -> Byte {
@@ -379,26 +412,48 @@ fn xor(bytes: &[u8], seed: u8) -> u8 {
     bytes.iter().fold(seed, |x, &b| x ^ b)
 }
 
+enum RequestRead {
+    Valid(u8, Vec<u8>),
+    MalformedKnown,
+    Unknown(u8),
+}
+
 /// Read one full request (`op` + fixed header + optional WRITE data + checksum), validating the checksum.
-fn read_request(link: &mut dyn Link) -> Option<(u8, Vec<u8>)> {
-    let op = read_frame_bytes(link, 1)?[0];
-    let hdr = seeder::request_header_len(op)?;
+fn read_request(link: &mut dyn Link) -> RequestRead {
+    let Some(op) = read_frame_bytes(link, 1).map(|b| b[0]) else {
+        return RequestRead::MalformedKnown;
+    };
+    let Some(hdr) = seeder::request_header_len(op) else {
+        return RequestRead::Unknown(op);
+    };
     let mut args = if hdr > 0 {
-        read_frame_bytes(link, hdr)?
+        let Some(args) = read_frame_bytes(link, hdr) else {
+            return RequestRead::MalformedKnown;
+        };
+        args
     } else {
         Vec::new()
     };
     if op == seeder::OP_WRITE {
         let dlen = u16::from_le_bytes([args[8], args[9]]) as usize;
         if dlen > seeder::WRITE_MAX {
-            return None; // guard a runaway frame
+            return RequestRead::MalformedKnown; // guard a runaway frame
         }
         if dlen > 0 {
-            args.extend(read_frame_bytes(link, dlen)?);
+            let Some(data) = read_frame_bytes(link, dlen) else {
+                return RequestRead::MalformedKnown;
+            };
+            args.extend(data);
         }
     }
-    let xsum = read_frame_bytes(link, 1)?[0];
-    (xsum == xor(&args, op)).then_some((op, args))
+    let Some(xsum) = read_frame_bytes(link, 1).map(|b| b[0]) else {
+        return RequestRead::MalformedKnown;
+    };
+    if xsum == xor(&args, op) {
+        RequestRead::Valid(op, args)
+    } else {
+        RequestRead::MalformedKnown
+    }
 }
 
 fn send_response(link: &mut dyn Link, op: u8, status: u8, payload: &[u8]) {
@@ -411,6 +466,225 @@ fn send_response(link: &mut dyn Link, op: u8, status: u8, payload: &[u8]) {
     let _ = link.write_all(&frame);
 }
 
+impl StreamState {
+    /// Consume one byte-stream event while continuing to answer seeder requests. Text and binary
+    /// frames share the serial wire, including while `ota folder on` is still refreshing sources.
+    fn pump(&mut self, link: &mut dyn Link, core: &SeederCore, verbose: bool) -> PumpEvent {
+        let b = match self.deferred.take() {
+            Some(b) => b,
+            None => match read_byte(link) {
+                Byte::Got(b) => b,
+                Byte::Timeout => return PumpEvent::Timeout,
+                Byte::Closed => return PumpEvent::Closed,
+            },
+        };
+
+        if self.pending_m {
+            self.pending_m = false;
+            if b == seeder::REQ_MAGIC[1] {
+                let log = match read_request(link) {
+                    RequestRead::Valid(op, args) => {
+                        // A binary frame is a hard boundary. Do not let an unterminated console
+                        // fragment become a prefix of the acknowledgement that follows the frame.
+                        self.line.clear();
+                        if let Some((status, payload)) = core.handle(op, &args) {
+                            send_response(link, op, status, &payload);
+                            verbose
+                                .then(|| request_log(op, &args, status, &payload))
+                                .flatten()
+                        } else {
+                            None
+                        }
+                    }
+                    RequestRead::MalformedKnown => {
+                        self.line.clear();
+                        None
+                    }
+                    RequestRead::Unknown(op) => {
+                        // `MS` is common in ordinary console text (`CHANNEL MSG`, for example).
+                        // An undefined opcode proves this was not one of our seeder frames. Replay
+                        // `MS` as text, then feed the opcode through normal candidate handling so an
+                        // overlapping `MSMS<op>` still finds the second, valid frame.
+                        if let Some(line) = self.push_literal(&seeder::REQ_MAGIC) {
+                            self.deferred = Some(op);
+                            return PumpEvent::DeviceLine(line);
+                        }
+                        return self.accept_unframed(op);
+                    }
+                };
+                // Report the magic even when the rest of the frame was damaged. Once a device has
+                // entered binary seeder framing, another ASCII enable command could corrupt it.
+                return PumpEvent::SeederFrame(log);
+            }
+            if let Some(line) = self.push_text(seeder::REQ_MAGIC[0]) {
+                // Retain the current byte if the defensive 512-byte flush happened on the pending M.
+                self.deferred = Some(b);
+                return PumpEvent::DeviceLine(line);
+            }
+        }
+
+        self.accept_unframed(b)
+    }
+
+    fn accept_unframed(&mut self, b: u8) -> PumpEvent {
+        if b == seeder::REQ_MAGIC[0] {
+            self.pending_m = true;
+            PumpEvent::Activity
+        } else if let Some(line) = self.push_text(b) {
+            PumpEvent::DeviceLine(line)
+        } else {
+            PumpEvent::Activity
+        }
+    }
+
+    fn push_text(&mut self, b: u8) -> Option<String> {
+        self.line.push(b as char);
+        if b != b'\n' && self.line.len() <= 512 {
+            return None;
+        }
+        let line = std::mem::take(&mut self.line);
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    }
+
+    fn push_literal(&mut self, bytes: &[u8]) -> Option<String> {
+        let mut emitted = None;
+        for &b in bytes {
+            if let Some(line) = self.push_text(b) {
+                emitted.get_or_insert(line);
+            }
+        }
+        emitted
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AttachPolicy {
+    settle: Duration,
+    retry_after: Duration,
+    timeout: Duration,
+    max_attempts: usize,
+}
+
+impl Default for AttachPolicy {
+    fn default() -> Self {
+        Self {
+            settle: SERIAL_OPEN_SETTLE,
+            retry_after: ATTACH_RETRY_AFTER,
+            timeout: ATTACH_TIMEOUT,
+            max_attempts: ATTACH_MAX_ATTEMPTS,
+        }
+    }
+}
+
+/// Enable the serial folder source and wait for the node's positive acknowledgement.
+///
+/// Source refresh is synchronous on the node, so it may issue COUNT/DESCRIBE/READ requests before
+/// printing `OK folder attached`. Those requests must be served during the handshake. A lost first
+/// command is retried only until binary framing appears, after which sending ASCII would be unsafe.
+pub fn attach_serial_folder(
+    link: &mut dyn Link,
+    core: &SeederCore,
+    verbose: bool,
+    mut devline: impl FnMut(&str),
+    stop: &AtomicBool,
+) -> Result<()> {
+    attach_serial_folder_with_policy(
+        link,
+        core,
+        verbose,
+        &mut devline,
+        stop,
+        AttachPolicy::default(),
+    )
+}
+
+fn attach_serial_folder_with_policy(
+    link: &mut dyn Link,
+    core: &SeederCore,
+    verbose: bool,
+    devline: &mut impl FnMut(&str),
+    stop: &AtomicBool,
+    policy: AttachPolicy,
+) -> Result<()> {
+    if !policy.settle.is_zero() {
+        thread::sleep(policy.settle);
+    }
+    if stop.load(Ordering::Relaxed) {
+        bail!("interrupted before enabling the serial folder source");
+    }
+
+    send_folder_on(link)?;
+    let mut attempts = 1usize;
+    let started = Instant::now();
+    let mut retry_at = started + policy.retry_after;
+    let deadline = started + policy.timeout;
+    let mut protocol_seen = false;
+    let mut stream = StreamState::default();
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            bail!("interrupted while enabling the serial folder source");
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for `OK folder attached` after {attempts} enable attempt{}",
+                if attempts == 1 { "" } else { "s" }
+            );
+        }
+
+        match stream.pump(link, core, verbose) {
+            PumpEvent::Closed => bail!("serial link closed while enabling the folder source"),
+            PumpEvent::SeederFrame(log) => {
+                protocol_seen = true;
+                if let Some(log) = log {
+                    devline(&log);
+                }
+            }
+            PumpEvent::DeviceLine(line) => {
+                devline(&line);
+                let reply = normalize_console_reply(&line);
+                if is_attach_ok(reply) {
+                    return Ok(());
+                }
+                if reply == "ERR" || reply.starts_with("ERR ") || reply.starts_with("ERR:") {
+                    bail!("node rejected `ota folder on`: {reply}");
+                }
+            }
+            PumpEvent::Activity | PumpEvent::Timeout => {}
+        }
+
+        let now = Instant::now();
+        if !protocol_seen && !stream.pending_m && attempts < policy.max_attempts && now >= retry_at
+        {
+            send_folder_on(link)?;
+            attempts += 1;
+            retry_at = now + policy.retry_after;
+        }
+    }
+}
+
+fn send_folder_on(link: &mut dyn Link) -> Result<()> {
+    link.write_all(FOLDER_ON)
+        .context("sending `ota folder on`")?;
+    link.flush().context("flushing `ota folder on`")
+}
+
+fn is_attach_ok(line: &str) -> bool {
+    has_reply_prefix(line, "OK folder attached") || has_reply_prefix(line, "OK folder refreshed")
+}
+
+/// Dedicated MeshCore OTA consoles render command replies with this exact marker. Full Companion's
+/// USB mOTA mode emits the reply bare, so accept either representation without substring matching.
+fn normalize_console_reply(line: &str) -> &str {
+    line.strip_prefix("  -> ").unwrap_or(line)
+}
+
+fn has_reply_prefix(line: &str, prefix: &str) -> bool {
+    line.strip_prefix(prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(' ') || rest.starts_with(':'))
+}
+
 /// Run the seeder framing loop until `stop` is set: resync on `M S`, verify the request, dispatch to
 /// `core`, frame the reply. Interleaved device text/log lines (serial only) are surfaced via `devline`.
 pub fn serve_loop(
@@ -420,65 +694,304 @@ pub fn serve_loop(
     mut devline: impl FnMut(&str),
     stop: &AtomicBool,
 ) {
-    let mut prev: Option<u8> = None;
-    let mut line = String::new();
+    let mut stream = StreamState::default();
 
     while !stop.load(Ordering::Relaxed) {
-        let b = match read_byte(link) {
-            Byte::Got(b) => b,
-            Byte::Timeout => continue,
-            Byte::Closed => break,
-        };
-
-        if prev == Some(seeder::REQ_MAGIC[0]) && b == seeder::REQ_MAGIC[1] {
-            prev = None;
-            if let Some((op, args)) = read_request(link) {
-                if let Some((status, payload)) = core.handle(op, &args) {
-                    send_response(link, op, status, &payload);
-                    if verbose {
-                        log_request(&mut devline, op, &args, status, &payload);
-                    }
-                }
-            }
-            continue;
+        match stream.pump(link, core, verbose) {
+            PumpEvent::Closed => break,
+            PumpEvent::DeviceLine(line) => devline(&line),
+            PumpEvent::SeederFrame(Some(log)) => devline(&log),
+            PumpEvent::Activity | PumpEvent::Timeout | PumpEvent::SeederFrame(None) => {}
         }
-
-        // Not a frame start: this is device text sharing the wire (serial console).
-        if let Some(p) = prev {
-            line.push(p as char);
-            if p == b'\n' || line.len() > 512 {
-                flush_line(&mut line, &mut devline);
-            }
-        }
-        prev = Some(b);
     }
 }
 
-fn flush_line(line: &mut String, devline: &mut impl FnMut(&str)) {
-    let trimmed = line.trim_end_matches(['\r', '\n']);
-    if !trimmed.is_empty() {
-        devline(trimmed);
-    }
-    line.clear();
-}
-
-fn log_request(devline: &mut impl FnMut(&str), op: u8, args: &[u8], status: u8, payload: &[u8]) {
+fn request_log(op: u8, args: &[u8], status: u8, payload: &[u8]) -> Option<String> {
     let ok = if status == seeder::STATUS_OK {
         "OK"
     } else {
         "ERR"
     };
-    let msg = match op {
-        seeder::OP_COUNT => format!("COUNT -> {}", payload.first().copied().unwrap_or(0)),
-        seeder::OP_DESCRIBE => format!("DESCRIBE {} {ok}", args[0]),
-        seeder::OP_READ => format!("READ {} @{} {ok}", args[0], rd_u32(args, 1)),
-        seeder::OP_DEFLATE_BLOCK => format!(
+    match op {
+        seeder::OP_COUNT => Some(format!(
+            "COUNT -> {}",
+            payload.first().copied().unwrap_or(0)
+        )),
+        seeder::OP_DESCRIBE => Some(format!("DESCRIBE {} {ok}", args[0])),
+        seeder::OP_READ => Some(format!("READ {} @{} {ok}", args[0], rd_u32(args, 1))),
+        seeder::OP_DEFLATE_BLOCK => Some(format!(
             "DEFLATE {} block={} @{} {ok}",
             args[0],
             u16::from_le_bytes([args[1], args[2]]),
             u16::from_le_bytes([args[3], args[4]])
-        ),
-        _ => return, // storage ops: quiet unless it matters
-    };
-    devline(&msg);
+        )),
+        _ => None, // storage ops: quiet unless it matters
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::io;
+
+    enum ReadStep {
+        Byte(u8),
+        Timeout(Duration),
+        Closed,
+    }
+
+    struct ScriptedLink {
+        reads: VecDeque<ReadStep>,
+        writes: Vec<u8>,
+    }
+
+    impl ScriptedLink {
+        fn new(reads: impl IntoIterator<Item = ReadStep>) -> Self {
+            Self {
+                reads: reads.into_iter().collect(),
+                writes: Vec::new(),
+            }
+        }
+    }
+
+    impl Read for ScriptedLink {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.reads.pop_front().unwrap_or(ReadStep::Closed) {
+                ReadStep::Byte(b) => {
+                    buf[0] = b;
+                    Ok(1)
+                }
+                ReadStep::Timeout(delay) => {
+                    thread::sleep(delay);
+                    Err(io::Error::new(ErrorKind::TimedOut, "scripted timeout"))
+                }
+                ReadStep::Closed => Ok(0),
+            }
+        }
+    }
+
+    impl Write for ScriptedLink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.writes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn byte_steps(bytes: &[u8]) -> Vec<ReadStep> {
+        bytes.iter().copied().map(ReadStep::Byte).collect()
+    }
+
+    fn count_request() -> Vec<u8> {
+        vec![
+            seeder::REQ_MAGIC[0],
+            seeder::REQ_MAGIC[1],
+            seeder::OP_COUNT,
+            seeder::OP_COUNT,
+        ]
+    }
+
+    fn test_core() -> SeederCore {
+        SeederCore::new(Folder { motas: Vec::new() }, None)
+    }
+
+    fn test_policy() -> AttachPolicy {
+        AttachPolicy {
+            settle: Duration::ZERO,
+            retry_after: Duration::from_millis(2),
+            timeout: Duration::from_millis(100),
+            max_attempts: 3,
+        }
+    }
+
+    fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+        haystack
+            .windows(needle.len())
+            .filter(|w| *w == needle)
+            .count()
+    }
+
+    #[test]
+    fn attach_retries_a_lost_first_command_and_serves_count_before_ack() {
+        let mut reads = vec![ReadStep::Timeout(Duration::from_millis(3))];
+        reads.extend(byte_steps(&count_request()));
+        reads.extend(byte_steps(
+            b"\r\n  -> OK folder attached (serial): advertising 1/1 host mOTAs\r\n",
+        ));
+        let mut link = ScriptedLink::new(reads);
+        let mut lines = Vec::new();
+
+        attach_serial_folder_with_policy(
+            &mut link,
+            &test_core(),
+            true,
+            &mut |line| lines.push(line.to_owned()),
+            &AtomicBool::new(false),
+            test_policy(),
+        )
+        .unwrap();
+
+        assert_eq!(occurrences(&link.writes, FOLDER_ON), 2);
+        assert!(link.writes.windows(2).any(|w| w == seeder::RSP_MAGIC));
+        assert!(lines.iter().any(|line| line == "COUNT -> 0"));
+        assert!(lines
+            .iter()
+            .any(|line| line == "  -> OK folder attached (serial): advertising 1/1 host mOTAs"));
+    }
+
+    #[test]
+    fn attach_never_retries_ascii_after_binary_framing_begins() {
+        let mut reads = byte_steps(&count_request());
+        reads.extend([
+            ReadStep::Timeout(Duration::from_millis(3)),
+            ReadStep::Timeout(Duration::from_millis(3)),
+        ]);
+        reads.extend(byte_steps(
+            b"OK folder refreshed (serial): advertising 0/0 host mOTAs\r\n",
+        ));
+        let mut link = ScriptedLink::new(reads);
+
+        attach_serial_folder_with_policy(
+            &mut link,
+            &test_core(),
+            false,
+            &mut |_| {},
+            &AtomicBool::new(false),
+            test_policy(),
+        )
+        .unwrap();
+
+        assert_eq!(occurrences(&link.writes, FOLDER_ON), 1);
+    }
+
+    #[test]
+    fn attach_does_not_retry_between_split_magic_bytes() {
+        let mut reads = vec![
+            ReadStep::Byte(seeder::REQ_MAGIC[0]),
+            ReadStep::Timeout(Duration::from_millis(3)),
+            ReadStep::Byte(seeder::REQ_MAGIC[1]),
+            ReadStep::Byte(seeder::OP_COUNT),
+            ReadStep::Byte(seeder::OP_COUNT),
+        ];
+        reads.extend(byte_steps(
+            b"OK folder attached (serial): advertising 0/0 host mOTAs\r\n",
+        ));
+        let mut link = ScriptedLink::new(reads);
+
+        attach_serial_folder_with_policy(
+            &mut link,
+            &test_core(),
+            false,
+            &mut |_| {},
+            &AtomicBool::new(false),
+            test_policy(),
+        )
+        .unwrap();
+
+        assert_eq!(occurrences(&link.writes, FOLDER_ON), 1);
+    }
+
+    #[test]
+    fn console_msg_text_does_not_suppress_a_lost_command_retry() {
+        let mut reads = byte_steps(b"CHANNEL MSG -> unrelated console text\r\n");
+        reads.push(ReadStep::Timeout(Duration::from_millis(3)));
+        reads.extend(byte_steps(&count_request()));
+        reads.extend(byte_steps(
+            b"  -> OK folder attached (serial): advertising 1/1 host mOTAs\r\n",
+        ));
+        let mut link = ScriptedLink::new(reads);
+        let mut lines = Vec::new();
+
+        attach_serial_folder_with_policy(
+            &mut link,
+            &test_core(),
+            false,
+            &mut |line| lines.push(line.to_owned()),
+            &AtomicBool::new(false),
+            test_policy(),
+        )
+        .unwrap();
+
+        assert_eq!(occurrences(&link.writes, FOLDER_ON), 2);
+        assert!(lines
+            .iter()
+            .any(|line| line == "CHANNEL MSG -> unrelated console text"));
+    }
+
+    #[test]
+    fn unknown_magic_candidate_preserves_an_overlapping_valid_frame() {
+        let mut reads = vec![
+            ReadStep::Byte(b'M'),
+            ReadStep::Byte(b'S'),
+            ReadStep::Byte(b'M'),
+            ReadStep::Byte(b'S'),
+            ReadStep::Byte(seeder::OP_COUNT),
+            ReadStep::Byte(seeder::OP_COUNT),
+        ];
+        reads.extend(byte_steps(
+            b"OK folder attached (serial): advertising 0/0 host mOTAs\r\n",
+        ));
+        let mut link = ScriptedLink::new(reads);
+
+        attach_serial_folder_with_policy(
+            &mut link,
+            &test_core(),
+            false,
+            &mut |_| {},
+            &AtomicBool::new(false),
+            test_policy(),
+        )
+        .unwrap();
+
+        assert_eq!(occurrences(&link.writes, FOLDER_ON), 1);
+        assert!(link.writes.windows(2).any(|w| w == seeder::RSP_MAGIC));
+    }
+
+    #[test]
+    fn attach_requires_positive_reply() {
+        let mut reads = byte_steps(b"ERR folder source unavailable\r\n");
+        reads.push(ReadStep::Closed);
+        let mut link = ScriptedLink::new(reads);
+
+        let err = attach_serial_folder_with_policy(
+            &mut link,
+            &test_core(),
+            false,
+            &mut |_| {},
+            &AtomicBool::new(false),
+            test_policy(),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("node rejected"));
+    }
+
+    #[test]
+    fn attach_retries_and_wait_are_bounded() {
+        let reads = (0..4).map(|_| ReadStep::Timeout(Duration::from_millis(3)));
+        let mut link = ScriptedLink::new(reads);
+        let policy = AttachPolicy {
+            settle: Duration::ZERO,
+            retry_after: Duration::from_millis(2),
+            timeout: Duration::from_millis(8),
+            max_attempts: 2,
+        };
+
+        let err = attach_serial_folder_with_policy(
+            &mut link,
+            &test_core(),
+            false,
+            &mut |_| {},
+            &AtomicBool::new(false),
+            policy,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("timed out"));
+        assert_eq!(occurrences(&link.writes, FOLDER_ON), 2);
+    }
 }

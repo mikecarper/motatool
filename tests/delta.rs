@@ -39,7 +39,7 @@ fn opts(new_fw: Vec<u8>, base_fw: Vec<u8>, ptype: PatchType) -> BuildOpts {
         fw: new_fw,
         base: Some(base_fw),
         patch_type: ptype,
-        inplace_memory: MEM,
+        inplace_memory: Some(MEM),
         segment_size: SEG,
         target_id: Some(0x04D4_13FD),
         fw_version: Some(0x0111_0000),

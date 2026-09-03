@@ -53,9 +53,11 @@ pub fn verify(blob: &[u8]) -> Vec<String> {
         problems.push("Ed25519 signature INVALID".into());
     }
 
-    // 5) a distributed container must not be pre-approved.
-    if m.is_approved() {
-        problems.push("container is pre-approved (must be FF FF FF FF on the wire)".into());
+    // 5) every distributed-container approval byte must remain erased. `APRV` is the complete local
+    // consent marker, but a torn/partial write is also not safe to redistribute.
+    if m.approval != APPROVAL_NONE {
+        problems
+            .push("approval is not FF FF FF FF (distributed container must be unapproved)".into());
     }
 
     problems

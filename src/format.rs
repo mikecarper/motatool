@@ -3,7 +3,8 @@
 //! A container is `MAGIC(4) ‖ total_size(4,LE) ‖ manifest(197) ‖ leaves[](block_count·4) ‖ payload ‖
 //! TRAILER(5)`. The manifest is **fixed-layout**: every field sits at a constant offset and is always
 //! present (base_hash / signer / signature are zero-filled when unused); only `leaves[]` and `payload`
-//! vary. This mirrors `src/helpers/ota/OtaFormat.h` and `docs/ota_protocol.md` — keep it byte-identical.
+//! vary. Application packages use format 2; privileged bootloader packages use the byte-identical but
+//! deliberately narrow format-3 profile. This mirrors MeshCore's `OtaFormat.h` and `ota_protocol.md`.
 
 use anyhow::{ensure, Result};
 
@@ -14,10 +15,14 @@ pub const HEADER_LEN: usize = 8; // MAGIC(4) + total_size(4)
 pub const TRAILER_LEN: usize = 5;
 
 // ---- manifest constants ----
-pub const FORMAT_VER: u8 = 0x02;
+pub const FORMAT_VER: u8 = 0x02; // application compatibility name
+pub const APP_FORMAT_VER: u8 = 0x02;
+pub const BOOT_FORMAT_VER: u8 = 0x03;
 pub const HASH_ALGO_SHA256: u8 = 0x12;
 pub const MFLAG_FULL: u8 = 0x01;
 pub const MFLAG_SIGNED: u8 = 0x02;
+pub const MFLAG_BOOTLOADER: u8 = 0x04;
+pub const MFLAG_KNOWN: u8 = MFLAG_FULL | MFLAG_SIGNED | MFLAG_BOOTLOADER;
 pub const APPROVAL_NONE: [u8; 4] = [0xFF; 4]; // required on the wire
 pub const APPROVAL_YES: [u8; 4] = *b"APRV";
 pub const MFL: usize = 197; // manifest-minus-leaves length (constant)
@@ -52,19 +57,44 @@ pub const ENDF_OFF_FWVER: usize = 16;
 pub const ENDF_OFF_TARGET: usize = 20;
 pub const ENDF_OFF_HWID: usize = 24;
 
-// ---- nRF52 in-place apply limits (mirror OtaFlashLayout_nrf52.h); used to warn on oversized deltas ----
-pub const NRF52_INPLACE_MEMORY: u32 = 0x0009_8000;
+// ---- nRF52 in-place layout (mirror OtaFlashLayout_nrf52.h / pio_endf.py) -------------------------
+//
+// New OTA-capable nRF52 images carry an authenticated layout record immediately before EndF.  The
+// record lets an offline packager size an in-place patch from flash geometry instead of guessing from a
+// board/target name.  Images built before that record existed retain the conservative 608 KiB fallback.
+pub const NRF52_FALLBACK_INPLACE_MEMORY: u32 = 0x0009_8000;
+/// Compatibility name retained for callers that used the old fixed default.
+pub const NRF52_INPLACE_MEMORY: u32 = NRF52_FALLBACK_INPLACE_MEMORY;
 pub const NRF52_INPLACE_SEGMENT: u32 = 4096;
-pub const NRF52_FLASH_SPAN: u32 = 0x000D_4000 - 0x0002_6000; // 0xAE000
-pub const NRF52_MAX_INPLACE_MOTA: u32 = NRF52_FLASH_SPAN - NRF52_INPLACE_MEMORY; // ~90 KB
+
+pub const NRF52_APP_BASE_S140_V6: u32 = 0x0002_6000;
+pub const NRF52_APP_BASE_S140_V7: u32 = 0x0002_7000;
+pub const NRF52_EXTRAFS_START: u32 = 0x000D_4000;
+pub const NRF52_BOOT_SCRATCH_START: u32 = 0x000E_0000;
+pub const NRF52_APP_END: u32 = 0x000E_D000;
+
+pub const NRF52_LAYOUT_MAGIC: [u8; 8] = *b"mOTALay1";
+pub const NRF52_LAYOUT_VERSION: u8 = 1;
+pub const NRF52_LAYOUT_LEN: usize = 24;
+pub const NRF52_LAYOUT_FLAG_SD: u8 = 0x01;
+pub const NRF52_LAYOUT_FLAG_INTERNAL_EXTRAFS: u8 = 0x02;
+pub const NRF52_LAYOUT_FLAG_QSPI: u8 = 0x04;
+pub const NRF52_LAYOUT_FLAG_BOOTLOADER_SCRATCH: u8 = 0x08;
+pub const NRF52_LAYOUT_FLAGS_KNOWN: u8 = NRF52_LAYOUT_FLAG_SD
+    | NRF52_LAYOUT_FLAG_INTERNAL_EXTRAFS
+    | NRF52_LAYOUT_FLAG_QSPI
+    | NRF52_LAYOUT_FLAG_BOOTLOADER_SCRATCH;
+
+/// Smallest legacy internal-flash span (S140 v7 app base through the legacy ExtraFS ceiling).
+pub const NRF52_FALLBACK_FLASH_SPAN: u32 = NRF52_EXTRAFS_START - NRF52_APP_BASE_S140_V7;
 
 /// The mota-seeder link protocol (host ⇄ node), mirroring `src/helpers/ota/MotaSeederProto.h`.
 ///
 /// Request  (host→node): `M S  op(1)  args…               xsum(1 = XOR of op‖args)`
 /// Response (node→host): `m s  op(1)  status(1)  payload…  xsum(1 = XOR of all prior)`
 pub mod seeder {
-    pub const REQ_MAGIC: [u8; 2] = [b'M', b'S'];
-    pub const RSP_MAGIC: [u8; 2] = [b'm', b's'];
+    pub const REQ_MAGIC: [u8; 2] = *b"MS";
+    pub const RSP_MAGIC: [u8; 2] = *b"ms";
     pub const OP_COUNT: u8 = 0x01; // → count(1)
     pub const OP_DESCRIBE: u8 = 0x02; // idx(1) → MotaDesc(38)
     pub const OP_READ: u8 = 0x03; // idx(1) off(4) len(2) → bytes
@@ -174,6 +204,9 @@ impl Manifest {
     pub fn is_signed(&self) -> bool {
         self.flags & MFLAG_SIGNED != 0
     }
+    pub fn is_bootloader(&self) -> bool {
+        self.flags & MFLAG_BOOTLOADER != 0
+    }
     pub fn is_approved(&self) -> bool {
         self.approval == APPROVAL_YES
     }
@@ -214,10 +247,18 @@ impl Manifest {
 
         let mf = &blob[HEADER_LEN..];
         let format_ver = mf[off::FORMAT_VER];
-        ensure!(
-            format_ver == FORMAT_VER,
-            "unsupported format_ver {format_ver}"
-        );
+        let flags = mf[off::FLAGS];
+        match format_ver {
+            APP_FORMAT_VER => ensure!(
+                flags & MFLAG_BOOTLOADER == 0 && flags & !MFLAG_KNOWN == 0,
+                "v2 application manifest has invalid flags"
+            ),
+            BOOT_FORMAT_VER => ensure!(
+                flags == MFLAG_FULL | MFLAG_SIGNED | MFLAG_BOOTLOADER,
+                "v3 bootloader manifest requires exact FULL|SIGNED|BOOTLOADER flags"
+            ),
+            _ => ensure!(false, "unsupported format_ver {format_ver}"),
+        }
 
         let block_size_log2 = mf[off::BLOCK_SIZE_LOG2];
         let payload_size = rd_u32(mf, off::PAYLOAD_SIZE);
@@ -234,7 +275,7 @@ impl Manifest {
 
         let m = Manifest {
             format_ver,
-            flags: mf[off::FLAGS],
+            flags,
             hash_algo: mf[off::HASH_ALGO],
             target_id: rd_u32(mf, off::TARGET_ID),
             fw_version: rd_u32(mf, off::FW_VERSION),
@@ -255,6 +296,27 @@ impl Manifest {
             m.total_size() == blob.len(),
             "geometry (leaves+payload) != file length"
         );
+        if m.is_bootloader() {
+            ensure!(
+                m.hash_algo == HASH_ALGO_SHA256
+                    && crate::bootloader::version_valid(m.fw_version)
+                    && m.codec_id == Codec::Full as u8
+                    && m.image_size as usize == crate::bootloader::IMAGE_SIZE
+                    && m.payload_size as usize == crate::bootloader::IMAGE_SIZE
+                    && m.block_size_log2 == 10
+                    && m.block_count == 40
+                    && m.base_hash == [0u8; 8],
+                "v3 bootloader manifest geometry/identity is invalid"
+            );
+            let payload = &blob[m.payload_off()..m.payload_off() + m.payload_size as usize];
+            crate::bootloader::validate_bootloader_image(
+                payload,
+                m.target_id,
+                &m.hw_id,
+                m.fw_version,
+            )
+            .map_err(|e| anyhow::anyhow!("v3 bootloader image contract: {e:#}"))?;
+        }
         Ok(m)
     }
 }

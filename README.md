@@ -14,8 +14,8 @@ to live in the MeshCore tree, kept **byte-for-byte compatible** with the firmwar
 | `build` (full image) | ✅ byte-identical to the firmware's own output |
 | `build --base` sequential (ESP32) | ✅ **pure Rust** delta (no runtime detools) — see [Deltas](#deltas) |
 | `build --base` in-place (nRF52) | ✅ **pure Rust** delta (no runtime detools) — see [Deltas](#deltas) |
-| `verify` | ✅ structure, block hashes, merkle root, image hash, Ed25519 signature |
-| `inspect` | ✅ dump every manifest field |
+| `verify` | ✅ application v2 + strict signed nRF52 bootloader v3 contract |
+| `inspect` | ✅ manifest fields + embedded v3 bootloader identity/capabilities |
 | `keygen` | ✅ Ed25519 signing keypair |
 | `serve` (USB serial + WiFi TCP) | ✅ folder relay + pull-to-folder capture + `--seed` warm-start — see [Serve](#serve) |
 
@@ -91,6 +91,11 @@ fixed-Huffman, and dynamic-Huffman DEFLATE blocks. Older nodes continue to use `
 Support is advertised in the existing descriptor's reserved capability byte, so newer firmware does not
 wait on operation `0x09` when connected to an older host daemon.
 
+On serial links, `serve` asserts DTR/RTS, lets USB CDC settle, and waits for the node to confirm that its
+folder source attached. A command lost during port-open is retried a bounded number of times; once binary
+seeder traffic begins, it is never mixed with another text command. Failure to attach stops the server
+instead of reporting a seeder that the node cannot use.
+
 The transport is decoupled from the protocol (a `SeederCore` turns each `(op, args)` request into a reply,
 framed separately for serial/TCP), so the same core could back a future BLE/GATT path.
 
@@ -101,6 +106,13 @@ hash truncation are held **byte-identical** to the MeshCore firmware — the spe
 [`docs/ota_protocol.md`](https://github.com/meshcore-dev/MeshCore/blob/main/docs/ota_protocol.md) plus
 `src/helpers/ota/OtaFormat.h` / `MerkleTree.cpp` in the firmware tree. Ed25519 signing is deterministic
 (RFC 8032), so signed containers match the firmware's / OpenSSL's output exactly.
+
+Application containers use format 2. `verify`, `inspect`, and `serve` also accept MeshCore's deliberately
+narrow format-3 nRF52840 bootloader profile: a signed 40 KiB full image with exact outer geometry, canonical
+embedded BLMF/BLM2 identity and continuity metadata, and one qualified `MOTABLDR` capability marker. A v3
+container that misses any part of that contract is rejected instead of being treated as a general full
+image. `build` continues to create application containers; bootloader packages come from MeshCore's
+qualified OTAFIX packaging flow, where production signing material remains outside this tool.
 
 Byte-exact equivalence was validated during the port against the reference C++ `motatool` (same firmware
 built with both tools → byte-for-byte-identical `.mota`, each verifying the other's), and the delta encoders
@@ -122,7 +134,16 @@ motatool build --base running_firmware.bin --fw new_firmware.bin --patch-type in
 `--base` must be the device's **real running image, with its `EndF` trailer** — the delta is applied to
 exactly that image on-device, and its 8-byte `base_hash` is checked against the running firmware before apply.
 The delta payload is a **detools** patch (`--compression crle`, matching the firmware's compile-time decoder
-config); `--patch-type in-place` also takes `--inplace-memory` (nRF52 default `0x98000`) and `--segment-size`.
+config). For `--patch-type in-place`, current nRF52 firmware embeds an authenticated `mOTALay1` record
+immediately before `EndF`; motatool reads its app base, staging ceiling, and storage flags, then derives the
+smallest safe page-aligned apply window from the complete base and target images. It also proves that an
+internal-flash container, rounded to whole erase pages, fits above that window. This avoids board-name tables
+and lets larger images such as T096 use their actual layout safely.
+
+Firmware predating the layout record retains the conservative `0x98000` window. If either image is too large
+for that fallback, the build fails with the required minimum instead of emitting a doomed patch. Use
+`--inplace-memory` only as an explicit compatibility override after verifying the installed bootloader and
+storage ceiling; `--segment-size` defaults to the nRF52 4096-byte flash page.
 
 **Both patch types are pure Rust** — [`src/encode.rs`](src/encode.rs) implements the detools
 `sequential` + `crle` (ESP32 A/B) and `in-place` + `crle` (nRF52 single-slot) formats (canonical bsdiff +

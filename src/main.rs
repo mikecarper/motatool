@@ -5,7 +5,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use motatool::crypto::{ed25519_keygen, load_key32};
 use motatool::endf::{pack_version, target_id_for_env, version_str};
 use motatool::input::read_input;
-use motatool::serve::{open_serial, open_tcp, serve_loop, Folder, SeederCore};
+use motatool::serve::{
+    attach_serial_folder, open_serial, open_tcp, serve_loop, Folder, SeederCore,
+};
 use motatool::{build, targets, verify, BuildOpts, Codec, Manifest, PatchType};
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -69,9 +71,10 @@ struct BuildArgs {
     /// Delta patch layout (with --base): `sequential` (ESP32 A/B) or `in-place` (nRF52 single-slot).
     #[arg(long = "patch-type", default_value = "sequential")]
     patch_type: CliPatchType,
-    /// In-place apply window in bytes; must match the device bootloader (nRF52 default 0x98000).
-    #[arg(long = "inplace-memory", default_value = "0x98000")]
-    inplace_memory: String,
+    /// Override the in-place apply window. By default it is derived from authenticated nRF52 layout
+    /// records; old images without those records use the conservative 0x98000 legacy window.
+    #[arg(long = "inplace-memory")]
+    inplace_memory: Option<String>,
     /// In-place segment size in bytes (default one nRF52 flash page).
     #[arg(long = "segment-size", default_value_t = 4096)]
     segment_size: u32,
@@ -199,7 +202,12 @@ fn cmd_build(a: BuildArgs) -> Result<()> {
         fw,
         base,
         patch_type: a.patch_type.into(),
-        inplace_memory: parse_u32_auto(&a.inplace_memory).context("--inplace-memory")?,
+        inplace_memory: a
+            .inplace_memory
+            .as_deref()
+            .map(parse_u32_auto)
+            .transpose()
+            .context("--inplace-memory")?,
         segment_size: a.segment_size,
         target_id,
         fw_version,
@@ -258,6 +266,12 @@ fn cmd_build(a: BuildArgs) -> Result<()> {
         m.block_count,
         built.bytes.len()
     );
+    if let Some(memory) = built.inplace_memory {
+        println!(
+            "  in-place memory=0x{memory:X}  segment={}B",
+            a.segment_size
+        );
+    }
     Ok(())
 }
 
@@ -294,7 +308,7 @@ fn cmd_verify(a: VerifyArgs) -> ExitCode {
         match (&parsed, problems.is_empty()) {
             (Some(m), true) => println!(
                 "OK    {file} : {} target={:08X} [{}] v{} hw={} {} blocks={} size={}",
-                if m.is_full() { "full" } else { "delta" },
+                kind_label(m),
                 m.target_id,
                 targets::label(m.target_id),
                 version_str(m.fw_version),
@@ -329,10 +343,11 @@ fn cmd_inspect(a: InspectArgs) -> Result<()> {
     println!("total_size     : {}", blob.len());
     println!("format_ver     : {}", m.format_ver);
     println!(
-        "flags          : 0x{:02x}  FULL={} SIGNED={}",
+        "flags          : 0x{:02x}  FULL={} SIGNED={} BOOTLOADER={}",
         m.flags,
         m.is_full(),
-        m.is_signed()
+        m.is_signed(),
+        m.is_bootloader()
     );
     println!("hash_algo      : 0x{:02x} (sha2-256)", m.hash_algo);
     println!(
@@ -375,6 +390,25 @@ fn cmd_inspect(a: InspectArgs) -> Result<()> {
     if m.is_signed() {
         println!("signer_pubkey  : {}", hex::encode_upper(m.signer));
         println!("signature      : {}", hex::encode_upper(m.signature));
+    }
+    if m.is_bootloader() {
+        let payload = &blob[m.payload_off()..m.payload_off() + m.payload_size as usize];
+        let identity = motatool::bootloader::validate_bootloader_image(
+            payload,
+            m.target_id,
+            &m.hw_id,
+            m.fw_version,
+        )?;
+        println!("bootloader_board: 0x{:08x}", identity.board_id);
+        println!("bootloader_name : {}", identity.device_name);
+        println!(
+            "bootloader_cont : S{} fwid=0x{:04x} app=0x{:x} ABI{}",
+            identity.softdevice_family,
+            identity.softdevice_fwid,
+            identity.app_base,
+            identity.layout_abi
+        );
+        println!("bootloader_store: 0x{:02x}", identity.storage_flags);
     }
     println!(
         "approval       : {}  ({})",
@@ -423,7 +457,11 @@ fn cmd_serve(a: ServeArgs) -> Result<()> {
             m.target_id,
             targets::label(m.target_id),
             version_str(m.fw_version),
-            m.codec().map(Codec::name_tag).unwrap_or("?"),
+            if m.is_bootloader() {
+                "bootloader"
+            } else {
+                m.codec().map(Codec::name_tag).unwrap_or("?")
+            },
             if m.is_signed() { "signed" } else { "unsigned" },
             m.block_count,
             s.bytes.len()
@@ -474,8 +512,20 @@ fn cmd_serve(a: ServeArgs) -> Result<()> {
     // auto-enables relaying on connect, so there's nothing to send.
     let enable = !use_tcp && !a.no_enable;
     if enable {
-        let _ = link.write_all(b"ota folder on\r\n");
-        println!("sent `ota folder on`");
+        if let Err(err) = attach_serial_folder(
+            &mut *link,
+            &core,
+            a.verbose,
+            |l| println!("  [dev] {l}"),
+            &stop,
+        ) {
+            // Fail closed: if the first command did reach the node, make a best-effort attempt to
+            // leave its serial console out of mOTA passthrough before returning the handshake error.
+            let _ = link.write_all(b"ota folder off\r\n");
+            let _ = link.flush();
+            return Err(err.context("serial folder source did not attach"));
+        }
+        println!("serial folder source attached");
     }
     println!("serving on {target} — Ctrl-C to stop");
 
@@ -495,6 +545,9 @@ fn cmd_serve(a: ServeArgs) -> Result<()> {
 }
 
 fn kind_label(m: &Manifest) -> &'static str {
+    if m.is_bootloader() {
+        return "bootloader";
+    }
     match m.codec() {
         Some(Codec::Full) | None if m.is_full() => "full",
         Some(Codec::DetoolsInplace) => "in-place delta",
