@@ -73,10 +73,13 @@ pub mod seeder {
     pub const OP_WRITE: u8 = 0x06; // mid(4) off(4) len(2) data(len) → OK
     pub const OP_SREAD: u8 = 0x07; // mid(4) off(4) len(2) → bytes (0xFF = unwritten)
     pub const OP_FIN: u8 = 0x08; // mid(4) → OK (validate + publish)
+    pub const OP_DEFLATE_BLOCK: u8 = 0x09; // idx(1) block(2) off(2) len(2) → total(2) + bytes
     pub const STATUS_OK: u8 = 0x00;
     pub const STATUS_ERR: u8 = 0x01;
     pub const DESC_WIRE: usize = 38; // MotaDesc wire size
+    pub const SOURCE_CAP_DEFLATE_BLOCK: u8 = 0x01;
     pub const WRITE_MAX: usize = 512; // max data bytes per WRITE/SREAD
+    pub const DEFLATE_READ_MAX: usize = 190; // response adds total(2), keeping the payload <= 192 bytes
 
     /// Fixed header length (bytes after `op`) for a request, or `None` for an unknown op. `OP_WRITE`
     /// additionally carries `len` data bytes after its 10-byte header.
@@ -84,7 +87,7 @@ pub mod seeder {
         Some(match op {
             OP_COUNT => 0,
             OP_DESCRIBE => 1,
-            OP_READ => 7,
+            OP_READ | OP_DEFLATE_BLOCK => 7,
             OP_STAT | OP_FIN => 4,
             OP_BEGIN => 8,
             OP_SREAD | OP_WRITE => 10,

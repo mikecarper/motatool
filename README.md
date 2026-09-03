@@ -84,6 +84,13 @@ leaves and pulls only the **differing** blocks over LoRa — a byte-exact captur
 slow transfer. Other flags: `--baud` (serial speed), `--no-recursive` (don't descend into sub-folders),
 `--no-enable` (don't auto-send `ota folder on`/`off` on the serial console), `-v` (log each request).
 
+Newer nodes can also request a logical 1 KiB payload block as an independent raw RFC 1951 DEFLATE stream.
+The host does the compression, so the embedded seeder carries no encoder; blocks which do not shrink
+automatically use the negotiated 171-byte raw DATA profile. OTA-capable receiver firmware accepts stored,
+fixed-Huffman, and dynamic-Huffman DEFLATE blocks. Older nodes continue to use `READ` unchanged.
+Support is advertised in the existing descriptor's reserved capability byte, so newer firmware does not
+wait on operation `0x09` when connected to an older host daemon.
+
 The transport is decoupled from the protocol (a `SeederCore` turns each `(op, args)` request into a reply,
 framed separately for serial/TCP), so the same core could back a future BLE/GATT path.
 

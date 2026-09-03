@@ -1,10 +1,12 @@
 //! Exercise the transport-agnostic `SeederCore` directly (no wire): the serve ops (COUNT/DESCRIBE/READ)
 //! and the pull-to-folder storage ops (STAT/BEGIN/WRITE/SREAD/FIN), including the warm-start seed overlay.
 
+use flate2::read::DeflateDecoder;
 use motatool::format::seeder::*;
 use motatool::format::{HEADER_LEN, MAGIC, MFL};
 use motatool::serve::{Folder, SeederCore};
 use motatool::{build, BuildOpts};
+use std::io::Read;
 
 fn a_mota() -> Vec<u8> {
     build(&BuildOpts {
@@ -48,6 +50,8 @@ fn serve_ops_count_describe_read() {
     assert_eq!(st, STATUS_OK);
     assert_eq!(desc.len(), DESC_WIRE);
     assert_eq!(&desc[0..4], &mota[HEADER_LEN + 20..HEADER_LEN + 24]); // mid == manifest merkle_root
+    assert_eq!(desc[34], 10);
+    assert_eq!(desc[35], SOURCE_CAP_DEFLATE_BLOCK);
 
     assert_eq!(core.handle(OP_DESCRIBE, &[9]).unwrap().0, STATUS_ERR); // out of range
 
@@ -59,6 +63,58 @@ fn serve_ops_count_describe_read() {
         core.handle(OP_READ, &read_args),
         Some((STATUS_OK, MAGIC.to_vec()))
     );
+}
+
+#[test]
+fn serves_independent_raw_deflate_blocks_in_bounded_slices() {
+    let dir = tempfile::tempdir().unwrap();
+    let mota = a_mota();
+    std::fs::write(dir.path().join("fw.mota"), &mota).unwrap();
+    let folder = Folder::scan(dir.path(), true, |_, why| {
+        panic!("valid mota skipped: {why}")
+    });
+    let core = SeederCore::new(folder, None);
+
+    let request = |block: u16, off: u16, len: u16| {
+        let mut args = vec![0u8];
+        args.extend_from_slice(&block.to_le_bytes());
+        args.extend_from_slice(&off.to_le_bytes());
+        args.extend_from_slice(&len.to_le_bytes());
+        core.handle(OP_DEFLATE_BLOCK, &args).unwrap()
+    };
+
+    let (status, size_reply) = request(0, 0, 0);
+    assert_eq!(status, STATUS_OK);
+    assert_eq!(size_reply.len(), 2);
+    let encoded_len = u16::from_le_bytes(size_reply.try_into().unwrap()) as usize;
+    assert!(encoded_len < 1024);
+
+    let mut encoded = Vec::with_capacity(encoded_len);
+    while encoded.len() < encoded_len {
+        let len = (encoded_len - encoded.len()).min(DEFLATE_READ_MAX) as u16;
+        let (status, reply) = request(0, encoded.len() as u16, len);
+        assert_eq!(status, STATUS_OK);
+        assert_eq!(
+            u16::from_le_bytes([reply[0], reply[1]]) as usize,
+            encoded_len
+        );
+        assert_eq!(reply.len(), len as usize + 2);
+        encoded.extend_from_slice(&reply[2..]);
+    }
+    let manifest = motatool::Manifest::parse(&mota).unwrap();
+    let mut decoded = Vec::new();
+    DeflateDecoder::new(&encoded[..])
+        .read_to_end(&mut decoded)
+        .unwrap();
+    assert_eq!(
+        decoded,
+        mota[manifest.payload_off()..manifest.payload_off() + 1024]
+    );
+
+    assert_eq!(request(0, 0, (DEFLATE_READ_MAX + 1) as u16).0, STATUS_ERR);
+    assert_eq!(request(0, 1, 0).0, STATUS_ERR);
+    assert_eq!(request(u16::MAX, 0, 0).0, STATUS_ERR);
+    assert_eq!(request(0, encoded_len as u16, 1).0, STATUS_ERR);
 }
 
 #[test]

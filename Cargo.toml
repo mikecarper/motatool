@@ -27,6 +27,7 @@ ureq = "2"
 serialport = { version = "4", default-features = false } # no libudev: we open by path, not enumerate
 walkdir = "2"
 ctrlc = "3"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]
 tempfile = "3"

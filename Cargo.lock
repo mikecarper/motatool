@@ -597,6 +597,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "ed25519-dalek",
+ "flate2",
  "hex",
  "ihex",
  "rand_core",

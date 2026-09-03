@@ -7,9 +7,9 @@
 use crate::format::{rd_u32, seeder, Manifest, HEADER_LEN, MAGIC, MFL};
 use crate::verify::verify;
 use anyhow::{Context, Result};
-use std::io::{ErrorKind, Read, Write};
+use flate2::{write::DeflateEncoder, Compression};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -125,11 +125,72 @@ impl SeederCore {
                     _ => (STATUS_ERR, vec![]),
                 })
             }
+            OP_DEFLATE_BLOCK => Some(self.deflate_block(args)),
             OP_STAT | OP_BEGIN | OP_WRITE | OP_SREAD | OP_FIN => {
                 Some(self.handle_storage(op, args))
             }
             _ => None,
         }
+    }
+
+    /// Return a slice of one independently raw-DEFLATE-compressed logical payload block. A zero-length
+    /// request queries only the encoded length. Firmware asks in bounded slices so the serial/TCP reply
+    /// remains below the node's fixed receive buffer. Blocks which do not shrink return STATUS_ERR and the
+    /// radio source transparently falls back to the negotiated 171-byte raw representation.
+    fn deflate_block(&self, args: &[u8]) -> (u8, Vec<u8>) {
+        use seeder::{DEFLATE_READ_MAX, STATUS_ERR, STATUS_OK};
+
+        if args.len() != 7 {
+            return (STATUS_ERR, vec![]);
+        }
+        let index = args[0] as usize;
+        let block = u16::from_le_bytes([args[1], args[2]]) as u32;
+        let off = u16::from_le_bytes([args[3], args[4]]) as usize;
+        let len = u16::from_le_bytes([args[5], args[6]]) as usize;
+        if len > DEFLATE_READ_MAX || (len == 0 && off != 0) {
+            return (STATUS_ERR, vec![]);
+        }
+
+        let Some(served) = self.folder.at(index) else {
+            return (STATUS_ERR, vec![]);
+        };
+        if block >= served.manifest.block_count {
+            return (STATUS_ERR, vec![]);
+        }
+        let block_size = served.manifest.block_size() as usize;
+        // MeshCore's radio descriptor and receiver accept logical blocks only through 1 KiB. Reject a
+        // syntactically valid larger-container geometry before allocating/compressing attacker-sized input.
+        if block_size == 0 || block_size > 1024 {
+            return (STATUS_ERR, vec![]);
+        }
+        let payload_start = served.manifest.payload_off();
+        let start = match payload_start.checked_add(block as usize * block_size) {
+            Some(v) => v,
+            None => return (STATUS_ERR, vec![]),
+        };
+        let payload_end = payload_start + served.manifest.payload_size as usize;
+        let end = start.saturating_add(block_size).min(payload_end);
+        if start >= end || end > served.bytes.len() {
+            return (STATUS_ERR, vec![]);
+        }
+
+        let Some(encoded) = deflate_raw(&served.bytes[start..end]) else {
+            return (STATUS_ERR, vec![]);
+        };
+        if encoded.is_empty() || encoded.len() >= end - start || encoded.len() > u16::MAX as usize {
+            return (STATUS_ERR, vec![]);
+        }
+        let Some(slice_end) = off.checked_add(len) else {
+            return (STATUS_ERR, vec![]);
+        };
+        if off > encoded.len() || slice_end > encoded.len() {
+            return (STATUS_ERR, vec![]);
+        }
+
+        let mut payload = Vec::with_capacity(2 + len);
+        payload.extend_from_slice(&(encoded.len() as u16).to_le_bytes());
+        payload.extend_from_slice(&encoded[off..slice_end]);
+        (STATUS_OK, payload)
     }
 
     /// "Pull to folder" storage ops — capture a `.mota` the node is fetching off-mesh, keyed by `mid[4]`:
@@ -201,7 +262,7 @@ impl SeederCore {
     fn publish(&self, part: &Path, done: &Path) -> std::io::Result<()> {
         let size = std::fs::metadata(part)?.len();
         let mut head = [0u8; 8];
-        std::fs::File::open(part)?.read_exact_at(&mut head, 0)?;
+        std::fs::File::open(part)?.read_exact(&mut head)?;
         if head[..4] != MAGIC || rd_u32(&head, 4) as u64 != size {
             return Err(std::io::Error::new(
                 ErrorKind::InvalidData,
@@ -212,8 +273,16 @@ impl SeederCore {
     }
 }
 
+/// One independently compressed raw RFC 1951 stream. The receiver's full decoder accepts every
+/// standard DEFLATE block type; wrapper-level raw fallback is used when this does not save bytes.
+fn deflate_raw(input: &[u8]) -> Option<Vec<u8>> {
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
+    encoder.write_all(input).ok()?;
+    encoder.finish().ok()
+}
+
 /// MotaDesc wire (38 B): mid[4] target(4) fwver(4) codec(1) flags(1) total(4) leaves_off(4) block_count(4)
-/// payload_off(4) payload_size(4) [+2 reserved].
+/// payload_off(4) payload_size(4) block_log2(1) source_caps(1) reserved(2).
 fn describe(s: &ServedMota) -> [u8; seeder::DESC_WIRE] {
     let m = &s.manifest;
     let mut w = [0u8; seeder::DESC_WIRE];
@@ -227,6 +296,8 @@ fn describe(s: &ServedMota) -> [u8; seeder::DESC_WIRE] {
     w[22..26].copy_from_slice(&m.block_count.to_le_bytes());
     w[26..30].copy_from_slice(&(m.payload_off() as u32).to_le_bytes());
     w[30..34].copy_from_slice(&m.payload_size.to_le_bytes());
+    w[34] = m.block_size_log2;
+    w[35] = seeder::SOURCE_CAP_DEFLATE_BLOCK;
     w
 }
 
@@ -237,15 +308,16 @@ fn store_path(store_dir: &Path, mid: &[u8; 4], part: bool) -> PathBuf {
 }
 
 fn write_at(path: &Path, off: u64, data: &[u8]) -> std::io::Result<()> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)?
-        .write_all_at(data, off)
+    let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
+    file.seek(SeekFrom::Start(off))?;
+    file.write_all(data)
 }
 
 fn read_at(path: &Path, off: u64, len: usize) -> std::io::Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
-    std::fs::File::open(path)?.read_exact_at(&mut buf, off)?;
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(off))?;
+    file.read_exact(&mut buf)?;
     Ok(buf)
 }
 
@@ -400,6 +472,12 @@ fn log_request(devline: &mut impl FnMut(&str), op: u8, args: &[u8], status: u8, 
         seeder::OP_COUNT => format!("COUNT -> {}", payload.first().copied().unwrap_or(0)),
         seeder::OP_DESCRIBE => format!("DESCRIBE {} {ok}", args[0]),
         seeder::OP_READ => format!("READ {} @{} {ok}", args[0], rd_u32(args, 1)),
+        seeder::OP_DEFLATE_BLOCK => format!(
+            "DEFLATE {} block={} @{} {ok}",
+            args[0],
+            u16::from_le_bytes([args[1], args[2]]),
+            u16::from_le_bytes([args[3], args[4]])
+        ),
         _ => return, // storage ops: quiet unless it matters
     };
     devline(&msg);
