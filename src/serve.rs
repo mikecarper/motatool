@@ -5,9 +5,9 @@
 //! reply — a future BLE/GATT path would call it directly) and a byte-stream [`serve_loop`] that frames it.
 
 use crate::format::{rd_u32, seeder, Manifest, HEADER_LEN, MAGIC, MFL};
+use crate::transport::deflate_raw;
 use crate::verify::verify;
 use anyhow::{bail, Context, Result};
-use flate2::{write::DeflateEncoder, Compression};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -279,14 +279,6 @@ impl SeederCore {
         }
         std::fs::rename(part, done)
     }
-}
-
-/// One independently compressed raw RFC 1951 stream. The receiver's full decoder accepts every
-/// standard DEFLATE block type; wrapper-level raw fallback is used when this does not save bytes.
-fn deflate_raw(input: &[u8]) -> Option<Vec<u8>> {
-    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
-    encoder.write_all(input).ok()?;
-    encoder.finish().ok()
 }
 
 /// MotaDesc wire (38 B): mid[4] target(4) fwver(4) codec(1) flags(1) total(4) leaves_off(4) block_count(4)

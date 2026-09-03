@@ -8,6 +8,7 @@ use motatool::input::read_input;
 use motatool::serve::{
     attach_serial_folder, open_serial, open_tcp, serve_loop, Folder, SeederCore,
 };
+use motatool::transport::deflate_transport_size;
 use motatool::{build, targets, verify, BuildOpts, Codec, Manifest, PatchType};
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -57,6 +58,8 @@ enum Command {
     Keygen(KeygenArgs),
     /// Serve a folder of .mota to a node over USB serial or WiFi, and capture pull-to-folder downloads.
     Serve(ServeArgs),
+    /// Measure exact per-block transport-DEFLATE sizes for a raw mOTA payload.
+    TransportSize(TransportSizeArgs),
 }
 
 #[derive(Args)]
@@ -158,6 +161,16 @@ struct ServeArgs {
     verbose: bool,
 }
 
+#[derive(Args)]
+struct TransportSizeArgs {
+    /// Raw mOTA payload (for a delta, the generated patch bytes).
+    #[arg(long)]
+    payload: PathBuf,
+    /// Logical payload block size; MeshCore radio OTA supports at most 1024.
+    #[arg(long = "block-size", default_value_t = 1024)]
+    block_size: usize,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
@@ -166,6 +179,7 @@ fn main() -> ExitCode {
         Command::Inspect(a) => cmd_inspect(a),
         Command::Keygen(a) => cmd_keygen(a),
         Command::Serve(a) => cmd_serve(a),
+        Command::TransportSize(a) => cmd_transport_size(a),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -174,6 +188,26 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn cmd_transport_size(a: TransportSizeArgs) -> Result<()> {
+    let payload = std::fs::read(&a.payload)
+        .with_context(|| format!("cannot read payload: {}", a.payload.display()))?;
+    if payload.is_empty() {
+        bail!("payload is empty: {}", a.payload.display());
+    }
+    let size = deflate_transport_size(&payload, a.block_size).map_err(anyhow::Error::msg)?;
+    println!(
+        "{{\"schema\":1,\"payload_bytes\":{},\"block_size\":{},\"block_count\":{},\"wire_bytes\":{},\"deflate_bytes\":{},\"deflate_blocks\":{},\"data_packets\":{}}}",
+        size.payload_bytes,
+        size.block_size,
+        size.block_count,
+        size.wire_bytes,
+        size.deflate_bytes,
+        size.deflate_blocks,
+        size.data_packets,
+    );
+    Ok(())
 }
 
 fn parse_u32_auto(s: &str) -> Result<u32> {

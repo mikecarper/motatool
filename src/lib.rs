@@ -14,6 +14,7 @@ pub mod input;
 pub mod merkle;
 pub mod serve;
 pub mod targets;
+pub mod transport;
 pub mod verify;
 
 pub use build::{build, BuildOpts, Built};
