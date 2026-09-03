@@ -21,6 +21,7 @@ const ATTACH_RETRY_AFTER: Duration = Duration::from_secs(2);
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(12);
 const ATTACH_MAX_ATTEMPTS: usize = 3;
 const FOLDER_ON: &[u8] = b"ota folder on\r\n";
+const FOLDER_OFF: &[u8] = b"ota folder off\r\n";
 
 // ---- served folder -------------------------------------------------------------------------------
 
@@ -336,12 +337,13 @@ pub fn open_serial(dev: &str, baud: u32) -> Result<Box<dyn Link>> {
         .dtr_on_open(true)
         .open()
         .with_context(|| format!("cannot open serial device: {dev}"))?;
-    // The builder applies DTR best-effort, so assert both lines once more and surface a real failure.
-    // RTS is held (not pulsed); this matches normal terminal clients and does not enable flow control.
+    // Assert DTR once more and surface a real failure. Keep RTS deasserted: Espressif native
+    // USB/JTAG serial targets can interpret asserted RTS as reset/boot control and remain unavailable
+    // for the entire folder-attach timeout. MeshCore's serial protocol does not use RTS flow control.
     port.write_data_terminal_ready(true)
         .with_context(|| format!("cannot assert DTR on serial device: {dev}"))?;
-    port.write_request_to_send(true)
-        .with_context(|| format!("cannot assert RTS on serial device: {dev}"))?;
+    port.write_request_to_send(false)
+        .with_context(|| format!("cannot deassert RTS on serial device: {dev}"))?;
     Ok(Box::new(port))
 }
 
@@ -662,6 +664,17 @@ fn send_folder_on(link: &mut dyn Link) -> Result<()> {
     link.flush().context("flushing `ota folder on`")
 }
 
+/// Leave the node's serial folder-source mode before closing the shared console.
+///
+/// Flushing is part of the operation: returning after only `write_all` can drop
+/// the command with a buffered serial transport while still telling the user
+/// that the server stopped normally.
+pub fn detach_serial_folder(link: &mut dyn Link) -> Result<()> {
+    link.write_all(FOLDER_OFF)
+        .context("sending `ota folder off`")?;
+    link.flush().context("flushing `ota folder off`")
+}
+
 fn is_attach_ok(line: &str) -> bool {
     has_reply_prefix(line, "OK folder attached") || has_reply_prefix(line, "OK folder refreshed")
 }
@@ -669,7 +682,8 @@ fn is_attach_ok(line: &str) -> bool {
 /// Dedicated MeshCore OTA consoles render command replies with this exact marker. Full Companion's
 /// USB mOTA mode emits the reply bare, so accept either representation without substring matching.
 fn normalize_console_reply(line: &str) -> &str {
-    line.strip_prefix("  -> ").unwrap_or(line)
+    let line = line.trim_start();
+    line.strip_prefix("-> ").unwrap_or(line)
 }
 
 fn has_reply_prefix(line: &str, prefix: &str) -> bool {
@@ -736,6 +750,7 @@ mod tests {
     struct ScriptedLink {
         reads: VecDeque<ReadStep>,
         writes: Vec<u8>,
+        flushes: usize,
     }
 
     impl ScriptedLink {
@@ -743,6 +758,7 @@ mod tests {
             Self {
                 reads: reads.into_iter().collect(),
                 writes: Vec::new(),
+                flushes: 0,
             }
         }
     }
@@ -770,6 +786,7 @@ mod tests {
         }
 
         fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
             Ok(())
         }
     }
@@ -805,6 +822,16 @@ mod tests {
             .windows(needle.len())
             .filter(|w| *w == needle)
             .count()
+    }
+
+    #[test]
+    fn detach_writes_complete_off_command_and_flushes_it() {
+        let mut link = ScriptedLink::new([]);
+
+        detach_serial_folder(&mut link).unwrap();
+
+        assert_eq!(link.writes, FOLDER_OFF);
+        assert_eq!(link.flushes, 1);
     }
 
     #[test]
@@ -960,6 +987,24 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("node rejected"));
+    }
+
+    #[test]
+    fn attach_accepts_indented_full_companion_reply() {
+        let mut reads =
+            byte_steps(b"\r\n  OK folder attached (serial): advertising 1/1 host mOTAs\r\n");
+        reads.push(ReadStep::Closed);
+        let mut link = ScriptedLink::new(reads);
+
+        attach_serial_folder_with_policy(
+            &mut link,
+            &test_core(),
+            false,
+            &mut |_| {},
+            &AtomicBool::new(false),
+            test_policy(),
+        )
+        .unwrap();
     }
 
     #[test]

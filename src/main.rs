@@ -7,7 +7,8 @@ use motatool::endf::{pack_version, target_id_for_env, version_str};
 use motatool::format::DEFAULT_BLOCK_SIZE;
 use motatool::input::read_input;
 use motatool::serve::{
-    attach_serial_folder, open_serial, open_tcp, serve_loop, Folder, SeederCore,
+    attach_serial_folder, detach_serial_folder, open_serial, open_tcp, serve_loop, Folder,
+    SeederCore,
 };
 use motatool::transport::deflate_transport_size;
 use motatool::{build, targets, verify, BuildOpts, Codec, Manifest, PatchType};
@@ -27,7 +28,6 @@ impl From<CliPatchType> for PatchType {
         }
     }
 }
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
@@ -556,8 +556,7 @@ fn cmd_serve(a: ServeArgs) -> Result<()> {
         ) {
             // Fail closed: if the first command did reach the node, make a best-effort attempt to
             // leave its serial console out of mOTA passthrough before returning the handshake error.
-            let _ = link.write_all(b"ota folder off\r\n");
-            let _ = link.flush();
+            let _ = detach_serial_folder(&mut *link);
             return Err(err.context("serial folder source did not attach"));
         }
         println!("serial folder source attached");
@@ -573,7 +572,7 @@ fn cmd_serve(a: ServeArgs) -> Result<()> {
     );
 
     if enable {
-        let _ = link.write_all(b"ota folder off\r\n");
+        detach_serial_folder(&mut *link)?;
     }
     println!("\nbye");
     Ok(())
