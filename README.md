@@ -111,6 +111,7 @@ routing identities are:
 |---|---:|---:|---|---:|
 | `xiao_nrf52840_ble` | `0x28860044` | `0x28860044` | `XIAO_BL_28860044` / `XIAO_DFU` | `0x0E` QSPI |
 | `xiao_nrf52840_ble_sense` | `0x28860045` | `0x28860045` | `XIAO_BL_28860045` / `XIAO_DFU` | `0x0E` QSPI |
+| `gat562` | `0x239A0029` | `0xD50D2D44` | `NRF_BL_239A0029_GAT562_DFU` / `GAT562_DFU` | `0x0A` internal |
 | `heltec_mesh_pocket` | `0x239A0071` | `0x059277F4` | `NRF_BL_239A0071_MESH_POCKET_OTA` / `MESH_POCKET_OTA` | `0x0A` internal |
 | `heltec_mesh_tower_v2` | `0x239A0071` | `0x1150F50E` | `NRF_BL_239A0071_TOWER_V2_OTA` / `TOWER_V2_OTA` | `0x0A` internal |
 | `heltec_mesh_tower_v2_sdcard` | `0x239A0071` | `0x1150F50E` | `NRF_BL_239A0071_TOWER_V2_OTA` / `TOWER_V2_OTA` | `0x09` SD |

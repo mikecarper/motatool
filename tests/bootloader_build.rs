@@ -139,6 +139,14 @@ fn qualified_inventory_matches_release_contract() {
             0x0E,
         ),
         (
+            BootloaderBoard::Gat562,
+            0xD50D_2D44,
+            "NRF_BL_239A0029_GAT562_DFU",
+            0x00B6,
+            0x0002_6000,
+            0x0A,
+        ),
+        (
             BootloaderBoard::HeltecMeshTowerV2,
             0x1150_F50E,
             "NRF_BL_239A0071_TOWER_V2_OTA",
@@ -312,7 +320,7 @@ fn hex_extraction_clips_outside_region_and_fills_holes() {
 
 #[test]
 fn cli_build_bootloader_matches_release_interface() {
-    let board = BootloaderBoard::HeltecT096;
+    let board = BootloaderBoard::Gat562;
     let image = synthetic_image(board, STORAGE_INTERNAL_UPDATE);
     let encoded = image_as_intel_hex(&image);
     assert_eq!(
@@ -321,9 +329,9 @@ fn cli_build_bootloader_matches_release_interface() {
     );
 
     let dir = tempfile::tempdir().unwrap();
-    let input = dir.path().join("heltec_t096_bootloader.hex");
+    let input = dir.path().join("gat562_bootloader.hex");
     let key = dir.path().join("signing.key");
-    let output = dir.path().join("update-heltec_t096.mota");
+    let output = dir.path().join("update-gat562.mota");
     std::fs::write(&input, encoded).unwrap();
     std::fs::write(&key, hex::encode_upper(TEST_SEED)).unwrap();
 
@@ -332,7 +340,7 @@ fn cli_build_bootloader_matches_release_interface() {
         .arg("--fw")
         .arg(&input)
         .arg("--board")
-        .arg("heltec_t096")
+        .arg("gat562")
         .arg("--sign")
         .arg(&key)
         .arg("--fw-version")
@@ -347,7 +355,7 @@ fn cli_build_bootloader_matches_release_interface() {
         String::from_utf8_lossy(&result.stderr)
     );
     let stdout = String::from_utf8(result.stdout).unwrap();
-    assert!(stdout.contains("board=heltec_t096"), "{stdout}");
+    assert!(stdout.contains("board=gat562"), "{stdout}");
 
     let blob = std::fs::read(output).unwrap();
     assert_eq!(blob.len(), PACKAGE_SIZE);

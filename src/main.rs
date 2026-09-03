@@ -39,6 +39,8 @@ enum CliBootloaderBoard {
     XiaoNrf52840Ble,
     #[value(name = "xiao_nrf52840_ble_sense", alias = "xiao-nrf52840-ble-sense")]
     XiaoNrf52840BleSense,
+    #[value(name = "gat562")]
+    Gat562,
     #[value(name = "heltec_mesh_tower_v2")]
     HeltecMeshTowerV2,
     #[value(name = "heltec_mesh_tower_v2_sdcard")]
@@ -74,6 +76,7 @@ impl CliBootloaderBoard {
         let board = match self {
             Self::XiaoNrf52840Ble => BootloaderBoard::XiaoNrf52840Ble,
             Self::XiaoNrf52840BleSense => BootloaderBoard::XiaoNrf52840BleSense,
+            Self::Gat562 => BootloaderBoard::Gat562,
             Self::HeltecMeshTowerV2 | Self::HeltecMeshTowerV2Sdcard => {
                 BootloaderBoard::HeltecMeshTowerV2
             }

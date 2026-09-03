@@ -57,6 +57,7 @@ const XIAO_SENSE: u32 = 0x2886_0045;
 pub enum BootloaderBoard {
     XiaoNrf52840Ble,
     XiaoNrf52840BleSense,
+    Gat562,
     HeltecMeshTowerV2,
     HeltecMeshPocket,
     HeltecT096,
@@ -72,9 +73,10 @@ pub enum BootloaderBoard {
     WismeshTag,
 }
 
-pub const BOOTLOADER_BOARDS: [BootloaderBoard; 15] = [
+pub const BOOTLOADER_BOARDS: [BootloaderBoard; 16] = [
     BootloaderBoard::XiaoNrf52840Ble,
     BootloaderBoard::XiaoNrf52840BleSense,
+    BootloaderBoard::Gat562,
     BootloaderBoard::HeltecMeshTowerV2,
     BootloaderBoard::HeltecMeshPocket,
     BootloaderBoard::HeltecT096,
@@ -109,7 +111,8 @@ impl BootloaderBoard {
             | Self::HeltecT1
             | Self::HeltecT114 => 0x239A_0071,
             Self::KeepteenLt1 | Self::PromicroNrf52840 => 0x239A_00B3,
-            Self::MinewsemiMx25le01
+            Self::Gat562
+            | Self::MinewsemiMx25le01
             | Self::WiscoreRak3401
             | Self::WiscoreRak4631Board
             | Self::WismeshTag => 0x239A_0029,
@@ -122,6 +125,7 @@ impl BootloaderBoard {
         match self {
             Self::XiaoNrf52840Ble => "xiao_nrf52840_ble",
             Self::XiaoNrf52840BleSense => "xiao_nrf52840_ble_sense",
+            Self::Gat562 => "gat562",
             Self::HeltecMeshTowerV2 => "heltec_mesh_tower_v2",
             Self::HeltecMeshPocket => "heltec_mesh_pocket",
             Self::HeltecT096 => "heltec_t096",
@@ -141,6 +145,7 @@ impl BootloaderBoard {
     pub const fn device_name(self) -> &'static str {
         match self {
             Self::XiaoNrf52840Ble | Self::XiaoNrf52840BleSense => "XIAO_DFU",
+            Self::Gat562 => "GAT562_DFU",
             Self::HeltecMeshTowerV2 => "TOWER_V2_OTA",
             Self::HeltecMeshPocket => "MESH_POCKET_OTA",
             Self::HeltecT096 => "T096_DFU",
@@ -302,6 +307,7 @@ pub fn bootloader_version_str(version: u32) -> String {
 }
 
 const INTERNAL_IDENTITIES: &[(u32, &str)] = &[
+    (0x239A_0029, "GAT562_DFU"),
     (0x239A_0071, "TOWER_V2_OTA"),
     (0x239A_0071, "T096_DFU"),
     (0x239A_0071, "T1_DFU"),
