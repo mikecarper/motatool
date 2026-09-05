@@ -343,10 +343,32 @@ fn validate_staging_fit(plan: InplacePlan, total: usize) -> Result<()> {
     };
     let page = u64::from(NRF52_INPLACE_SEGMENT);
     let total = u64::try_from(total).context(".mota length does not fit u64")?;
-    let staged = total
-        .checked_add(page - 1)
-        .map(|v| v / page * page)
-        .context("staged container size overflow")?;
+    let page_round_up = |value: u64| -> Result<u64> {
+        value
+            .checked_add(page - 1)
+            .map(|v| v / page * page)
+            .context("staged container size overflow")
+    };
+    let staged = if plan.base_layout.is_some_and(Nrf52Layout::hybrid_ram) {
+        // MeshCore keeps at least the first flash page (header, manifest and
+        // APRV) internal, then places at most 64 KiB of the logical tail in
+        // reset-retained SRAM.  Rounding the flash charge, rather than the
+        // whole container, exactly matches its deterministic split planner.
+        let overflow = total.saturating_sub(u64::from(NRF52_HYBRID_RAM_SIZE));
+        let flash_charge = page_round_up(overflow)?.max(page);
+        // A small package may still fit wholly in flash.  The layout flag is
+        // a capability, not a requirement that every transfer use SRAM.
+        if flash_charge < total {
+            ensure!(
+                total - flash_charge <= u64::from(NRF52_HYBRID_RAM_SIZE),
+                "in-place: hybrid RAM suffix exceeds {} bytes",
+                NRF52_HYBRID_RAM_SIZE
+            );
+        }
+        flash_charge
+    } else {
+        page_round_up(total)?
+    };
     let used = u64::from(plan.memory)
         .checked_add(staged)
         .context("in-place workspace calculation overflow")?;
@@ -428,5 +450,46 @@ mod tests {
             legacy_auto: false,
         };
         assert!(validate_staging_fit(plan, 1_000_000).is_ok());
+    }
+
+    #[test]
+    fn hybrid_layout_charges_only_deterministic_flash_prefix() {
+        let layout = Nrf52Layout {
+            app_base: NRF52_APP_BASE_S140_V6,
+            linked_app_end: NRF52_APP_END,
+            stage_ceiling: NRF52_APP_END,
+            flags: NRF52_LAYOUT_FLAG_HYBRID_RAM,
+        };
+        let span = layout.stage_ceiling - layout.app_base;
+        let plan = InplacePlan {
+            memory: span - 0x2000,
+            base_layout: Some(layout),
+            legacy_auto: false,
+        };
+
+        // An overflow just beyond one page needs a two-page flash prefix.
+        assert!(validate_staging_fit(plan, NRF52_HYBRID_RAM_SIZE as usize + 0x1001).is_ok());
+        // One byte beyond that two-page band charges a third page and no
+        // longer fits beside the selected detools workspace.
+        let err = validate_staging_fit(plan, NRF52_HYBRID_RAM_SIZE as usize + 0x2001)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("page-rounded"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn hybrid_layout_keeps_small_pure_flash_packages_buildable() {
+        let layout = Nrf52Layout {
+            app_base: NRF52_APP_BASE_S140_V6,
+            linked_app_end: NRF52_APP_END,
+            stage_ceiling: NRF52_APP_END,
+            flags: NRF52_LAYOUT_FLAG_HYBRID_RAM,
+        };
+        let plan = InplacePlan {
+            memory: layout.stage_ceiling - layout.app_base - 0x1000,
+            base_layout: Some(layout),
+            legacy_auto: false,
+        };
+        assert!(validate_staging_fit(plan, 0x1000).is_ok());
     }
 }

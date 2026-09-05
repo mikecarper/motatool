@@ -42,6 +42,10 @@ impl Nrf52Layout {
         self.flags & NRF52_LAYOUT_FLAG_BOOTLOADER_SCRATCH != 0
     }
 
+    pub fn hybrid_ram(self) -> bool {
+        self.flags & NRF52_LAYOUT_FLAG_HYBRID_RAM != 0
+    }
+
     /// Internal application workspace available to the currently running image.  QSPI bootloader-update
     /// builds reserve the final 0xA000 below APP_END as scratch; all other supported layouts may apply an
     /// application through APP_END (internal staging is bounded separately by `stage_ceiling`).
@@ -94,6 +98,20 @@ impl Nrf52Layout {
             !(self.external_backed() && self.uses_internal_extrafs()),
             "nRF52 external staging cannot also reserve internal ExtraFS"
         );
+        ensure!(
+            !(self.hybrid_ram() && self.external_backed()),
+            "nRF52 hybrid RAM staging cannot use SD or QSPI storage"
+        );
+        ensure!(
+            !(self.hybrid_ram() && self.uses_internal_extrafs()),
+            "nRF52 hybrid RAM staging cannot reserve internal ExtraFS"
+        );
+        if self.hybrid_ram() {
+            ensure!(
+                self.linked_app_end == NRF52_APP_END && self.stage_ceiling == NRF52_APP_END,
+                "nRF52 hybrid RAM staging requires the exact 0xED000 internal-only profile"
+            );
+        }
         if self.bootloader_scratch() {
             ensure!(
                 self.qspi_backed()
@@ -333,8 +351,41 @@ mod tests {
                 stage_ceiling: NRF52_EXTRAFS_START,
                 flags: 0,
             },
+            Nrf52Layout {
+                app_base: NRF52_APP_BASE_S140_V6,
+                linked_app_end: NRF52_APP_END,
+                stage_ceiling: NRF52_APP_END,
+                flags: NRF52_LAYOUT_FLAG_HYBRID_RAM | NRF52_LAYOUT_FLAG_QSPI,
+            },
+            Nrf52Layout {
+                app_base: NRF52_APP_BASE_S140_V6,
+                linked_app_end: NRF52_EXTRAFS_START,
+                stage_ceiling: NRF52_EXTRAFS_START,
+                flags: NRF52_LAYOUT_FLAG_HYBRID_RAM | NRF52_LAYOUT_FLAG_INTERNAL_EXTRAFS,
+            },
+            Nrf52Layout {
+                app_base: NRF52_APP_BASE_S140_V6,
+                linked_app_end: NRF52_EXTRAFS_START,
+                stage_ceiling: NRF52_APP_END,
+                flags: NRF52_LAYOUT_FLAG_HYBRID_RAM,
+            },
         ] {
             assert!(build_nrf52_layout(layout).is_err());
         }
+    }
+
+    #[test]
+    fn nrf52_hybrid_layout_roundtrips() {
+        let layout = Nrf52Layout {
+            app_base: NRF52_APP_BASE_S140_V6,
+            linked_app_end: NRF52_APP_END,
+            stage_ceiling: NRF52_APP_END,
+            flags: NRF52_LAYOUT_FLAG_HYBRID_RAM,
+        };
+        let record = build_nrf52_layout(layout).unwrap();
+        let (image, _) = ensure_endf(&record, &FwIdent::default());
+        assert_eq!(parse_nrf52_layout(&image).unwrap(), Some(layout));
+        assert!(layout.hybrid_ram());
+        assert!(!layout.external_backed());
     }
 }
