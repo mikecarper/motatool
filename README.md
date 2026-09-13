@@ -103,7 +103,7 @@ Every output has the strict MeshCore bootloader profile:
   application base, layout ABI, storage profile, signed `target_id`, and signed `hw_id`.
 
 The compatibility tuple is S140 7.3.0 (`family=140`, `FWID=0x0123`, `app_base=0x27000`) for both XIAO
-variants, Minewsemi MX25LE01, and T1000-E. Every other current profile uses S140 6.1.1 (`family=140`,
+variants, SenseCAP Solar P1, Wio Tracker L1, Minewsemi MX25LE01, and T1000-E. Every other current profile uses S140 6.1.1 (`family=140`,
 `FWID=0x00B6`, `app_base=0x26000`). All current profiles require layout ABI 1. The exact selectors and signed
 routing identities are:
 
@@ -126,11 +126,27 @@ routing identities are:
 | `wiscore_rak3401` | `0x239A0029` | `0x23818A80` | `NRF_BL_239A0029_3401_DFU` / `3401_DFU` | `0x0A` internal |
 | `wiscore_rak4631_board` | `0x239A0029` | `0x2D0DF000` | `NRF_BL_239A0029_4631_DFU` / `4631_DFU` | `0x0A` internal |
 | `wismesh_tag` | `0x239A0029` | `0xC72E9C9C` | `NRF_BL_239A0029_RTAG_DFU` / `RTAG_DFU` | `0x0A` internal |
+| `lilygo_techo` | `0x239A0029` | `0xBBA67475` | `NRF_BL_239A0029_LGTE_DFU` / `LGTE_DFU` | `0x0E` QSPI |
+| `lilygo_techo_lite` | `0x239A00DA` | `0xDFF3CD4E` | `NRF_BL_239A00DA_LTEL_DFU` / `LTEL_DFU` | `0x0E` QSPI |
+| `pca10056` | `0x239A00DA` | `0x48D116AE` | `NRF_BL_239A00DA_N056_DFU` / `N056_DFU` | `0x0E` QSPI |
+| `sensecap_solar_p1` | `0x28860044` | `0xD677B472` | `NRF_BL_28860044_SCAP_DFU` / `SCAP_DFU` | `0x0E` QSPI |
+| `thinknode_m1` | `0x239A00DA` | `0x3F5E2F7F` | `NRF_BL_239A00DA_TNM1_DFU` / `TNM1_DFU` | `0x0E` QSPI |
+| `thinknode_m6` | `0x239A00DA` | `0x02D5626D` | `NRF_BL_239A00DA_TNM6_DFU` / `TNM6_DFU` | `0x0E` QSPI |
+| `wio_tracker_l1` | `0x28861667` | `0x2F336AE1` | `NRF_BL_28861667_WTL1_DFU` / `WTL1_DFU` | `0x0E` QSPI |
+| `wiscore_rak3401_rak13302_w25q16` | `0x239A0029` | `0xFEF255E8` | `NRF_BL_239A0029_3401_W25Q16_DFU` / `3401_W25Q16_DFU` | `0x0E` QSPI |
+| `wiscore_rak4631_board_rak15001_slot_c` | `0x239A0029` | `0xAD73349E` | `NRF_BL_239A0029_4631_15001C_DFU` / `4631_15001C_DFU` | `0x0E` QSPI |
+| `wiscore_rak4631_w25q16` | `0x239A0029` | `0x86D45B01` | `NRF_BL_239A0029_4631_W25Q16_DFU` / `4631_W25Q16_DFU` | `0x0E` QSPI |
 
 Generic `DEVICE_NAME` values are 1 through 15 non-space printable ASCII bytes followed by NUL padding. Their
 canonical hardware ID is `NRF_BL_<BOARDID8>_<DEVICE_NAME>`, NUL-padded to 32 bytes, and their wire target is
 the little-endian first four bytes of SHA-256 over all 32 hardware-ID bytes. XIAO retains its deployed raw
 board-ID target and `XIAO_BL_*` hardware ID.
+
+SenseCAP Solar P1 deliberately retains `SCAP_DFU` even though it shares a USB
+ID with XIAO. The carrier's bootloader image is not interchangeable with XIAO.
+Generic QSPI profiles retain their normal application ceiling; their firmware
+must prove the live application ends below the temporary `0xE0000` scratch range
+before a bootloader update. Do not force an update past this headroom check.
 
 The two MeshTower selectors deliberately share one signed physical identity. Their storage markers remain
 different and are checked at install time, but an over-the-air catalog cannot distinguish them before

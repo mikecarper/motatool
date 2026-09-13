@@ -71,9 +71,19 @@ pub enum BootloaderBoard {
     WiscoreRak3401,
     WiscoreRak4631Board,
     WismeshTag,
+    LilygoTecho,
+    LilygoTechoLite,
+    Pca10056,
+    SensecapSolarP1,
+    ThinknodeM1,
+    ThinknodeM6,
+    WioTrackerL1,
+    WiscoreRak3401Rak13302W25q16,
+    WiscoreRak4631Rak15001SlotC,
+    WiscoreRak4631W25q16,
 }
 
-pub const BOOTLOADER_BOARDS: [BootloaderBoard; 16] = [
+pub const BOOTLOADER_BOARDS: [BootloaderBoard; 26] = [
     BootloaderBoard::XiaoNrf52840Ble,
     BootloaderBoard::XiaoNrf52840BleSense,
     BootloaderBoard::Gat562,
@@ -90,6 +100,16 @@ pub const BOOTLOADER_BOARDS: [BootloaderBoard; 16] = [
     BootloaderBoard::WiscoreRak3401,
     BootloaderBoard::WiscoreRak4631Board,
     BootloaderBoard::WismeshTag,
+    BootloaderBoard::LilygoTecho,
+    BootloaderBoard::LilygoTechoLite,
+    BootloaderBoard::Pca10056,
+    BootloaderBoard::SensecapSolarP1,
+    BootloaderBoard::ThinknodeM1,
+    BootloaderBoard::ThinknodeM6,
+    BootloaderBoard::WioTrackerL1,
+    BootloaderBoard::WiscoreRak3401Rak13302W25q16,
+    BootloaderBoard::WiscoreRak4631Rak15001SlotC,
+    BootloaderBoard::WiscoreRak4631W25q16,
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,6 +138,16 @@ impl BootloaderBoard {
             | Self::WismeshTag => 0x239A_0029,
             Self::T1000E => 0x2886_0057,
             Self::ThinknodeM3 => 0x239A_00DA,
+            Self::LilygoTecho => 0x239A0029,
+            Self::LilygoTechoLite => 0x239A00DA,
+            Self::Pca10056 => 0x239A00DA,
+            Self::SensecapSolarP1 => 0x28860044,
+            Self::ThinknodeM1 => 0x239A00DA,
+            Self::ThinknodeM6 => 0x239A00DA,
+            Self::WioTrackerL1 => 0x28861667,
+            Self::WiscoreRak3401Rak13302W25q16 => 0x239A0029,
+            Self::WiscoreRak4631Rak15001SlotC => 0x239A0029,
+            Self::WiscoreRak4631W25q16 => 0x239A0029,
         }
     }
 
@@ -139,6 +169,16 @@ impl BootloaderBoard {
             Self::WiscoreRak3401 => "wiscore_rak3401",
             Self::WiscoreRak4631Board => "wiscore_rak4631_board",
             Self::WismeshTag => "wismesh_tag",
+            Self::LilygoTecho => "lilygo_techo",
+            Self::LilygoTechoLite => "lilygo_techo_lite",
+            Self::Pca10056 => "pca10056",
+            Self::SensecapSolarP1 => "sensecap_solar_p1",
+            Self::ThinknodeM1 => "thinknode_m1",
+            Self::ThinknodeM6 => "thinknode_m6",
+            Self::WioTrackerL1 => "wio_tracker_l1",
+            Self::WiscoreRak3401Rak13302W25q16 => "wiscore_rak3401_rak13302_w25q16",
+            Self::WiscoreRak4631Rak15001SlotC => "wiscore_rak4631_board_rak15001_slot_c",
+            Self::WiscoreRak4631W25q16 => "wiscore_rak4631_w25q16",
         }
     }
 
@@ -159,12 +199,32 @@ impl BootloaderBoard {
             Self::WiscoreRak3401 => "3401_DFU",
             Self::WiscoreRak4631Board => "4631_DFU",
             Self::WismeshTag => "RTAG_DFU",
+            Self::LilygoTecho => "LGTE_DFU",
+            Self::LilygoTechoLite => "LTEL_DFU",
+            Self::Pca10056 => "N056_DFU",
+            Self::SensecapSolarP1 => "SCAP_DFU",
+            Self::ThinknodeM1 => "TNM1_DFU",
+            Self::ThinknodeM6 => "TNM6_DFU",
+            Self::WioTrackerL1 => "WTL1_DFU",
+            Self::WiscoreRak3401Rak13302W25q16 => "3401_W25Q16_DFU",
+            Self::WiscoreRak4631Rak15001SlotC => "4631_15001C_DFU",
+            Self::WiscoreRak4631W25q16 => "4631_W25Q16_DFU",
         }
     }
 
     pub const fn storage_profile(self) -> u8 {
         match self {
             Self::XiaoNrf52840Ble | Self::XiaoNrf52840BleSense => STORAGE_QSPI_UPDATE,
+            Self::LilygoTecho => STORAGE_QSPI_UPDATE,
+            Self::LilygoTechoLite => STORAGE_QSPI_UPDATE,
+            Self::Pca10056 => STORAGE_QSPI_UPDATE,
+            Self::SensecapSolarP1 => STORAGE_QSPI_UPDATE,
+            Self::ThinknodeM1 => STORAGE_QSPI_UPDATE,
+            Self::ThinknodeM6 => STORAGE_QSPI_UPDATE,
+            Self::WioTrackerL1 => STORAGE_QSPI_UPDATE,
+            Self::WiscoreRak3401Rak13302W25q16 => STORAGE_QSPI_UPDATE,
+            Self::WiscoreRak4631Rak15001SlotC => STORAGE_QSPI_UPDATE,
+            Self::WiscoreRak4631W25q16 => STORAGE_QSPI_UPDATE,
             _ => STORAGE_INTERNAL_UPDATE,
         }
     }
@@ -191,6 +251,8 @@ impl BootloaderBoard {
             Self::XiaoNrf52840Ble
             | Self::XiaoNrf52840BleSense
             | Self::MinewsemiMx25le01
+            | Self::SensecapSolarP1
+            | Self::WioTrackerL1
             | Self::T1000E => BootloaderCompatibility {
                 softdevice_family: FAMILY_S140,
                 softdevice_fwid: S140_V7_FWID,
@@ -306,6 +368,19 @@ pub fn bootloader_version_str(version: u32) -> String {
     }
 }
 
+const QSPI_IDENTITIES: &[(u32, &str)] = &[
+    (0x239A0029, "LGTE_DFU"),
+    (0x239A00DA, "LTEL_DFU"),
+    (0x239A00DA, "N056_DFU"),
+    (0x28860044, "SCAP_DFU"),
+    (0x239A00DA, "TNM1_DFU"),
+    (0x239A00DA, "TNM6_DFU"),
+    (0x28861667, "WTL1_DFU"),
+    (0x239A0029, "3401_W25Q16_DFU"),
+    (0x239A0029, "4631_15001C_DFU"),
+    (0x239A0029, "4631_W25Q16_DFU"),
+];
+
 const INTERNAL_IDENTITIES: &[(u32, &str)] = &[
     (0x239A_0029, "GAT562_DFU"),
     (0x239A_0071, "TOWER_V2_OTA"),
@@ -323,6 +398,8 @@ const INTERNAL_IDENTITIES: &[(u32, &str)] = &[
     (0x239A_0029, "RTAG_DFU"),
 ];
 const S140_V7_IDENTITIES: &[(u32, &str)] = &[
+    (0x28860044, "SCAP_DFU"),
+    (0x28861667, "WTL1_DFU"),
     (XIAO_BASE, "XIAO_DFU"),
     (XIAO_SENSE, "XIAO_DFU"),
     (0x239A_0029, "MX25_DFU"),
@@ -365,8 +442,8 @@ pub fn bootloader_hw_id(board_id: u32, device_name: &str) -> Result<[u8; 32]> {
         "invalid embedded bootloader board/name identity"
     );
     let text = match board_id {
-        XIAO_BASE => "XIAO_BL_28860044".to_owned(),
-        XIAO_SENSE => "XIAO_BL_28860045".to_owned(),
+        XIAO_BASE if device_name == "XIAO_DFU" => "XIAO_BL_28860044".to_owned(),
+        XIAO_SENSE if device_name == "XIAO_DFU" => "XIAO_BL_28860045".to_owned(),
         _ => format!("NRF_BL_{board_id:08X}_{device_name}"),
     };
     ensure!(
@@ -379,7 +456,7 @@ pub fn bootloader_hw_id(board_id: u32, device_name: &str) -> Result<[u8; 32]> {
 }
 
 pub fn bootloader_target_id(board_id: u32, device_name: &str) -> Result<u32> {
-    if matches!(board_id, XIAO_BASE | XIAO_SENSE) {
+    if matches!(board_id, XIAO_BASE | XIAO_SENSE) && device_name == "XIAO_DFU" {
         return Ok(board_id);
     }
     let hw = bootloader_hw_id(board_id, device_name)?;
@@ -504,6 +581,9 @@ fn padded_name(name: &[u8]) -> Result<[u8; 16]> {
 }
 
 fn valid_device_name(board_id: u32, raw: &[u8; 16]) -> Option<&str> {
+    if board_id == XIAO_BASE && raw == b"SCAP_DFU\0\0\0\0\0\0\0\0" {
+        return Some("SCAP_DFU");
+    }
     if matches!(board_id, 0 | u32::MAX) {
         return None;
     }
@@ -645,7 +725,9 @@ fn qualified_storage(board_id: u32, name: &str) -> &'static [u8] {
     const INTERNAL: &[u8] = &[STORAGE_INTERNAL_UPDATE];
     const QSPI: &[u8] = &[STORAGE_QSPI_UPDATE];
     const TOWER: &[u8] = &[STORAGE_INTERNAL_UPDATE, STORAGE_SD_UPDATE];
-    if matches!(board_id, XIAO_BASE | XIAO_SENSE) && name == "XIAO_DFU" {
+    if (matches!(board_id, XIAO_BASE | XIAO_SENSE) && name == "XIAO_DFU")
+        || QSPI_IDENTITIES.contains(&(board_id, name))
+    {
         QSPI
     } else if board_id == 0x239A_0071 && name == "TOWER_V2_OTA" {
         TOWER
@@ -658,7 +740,8 @@ fn qualified_storage(board_id: u32, name: &str) -> &'static [u8] {
 
 fn qualified_platform(board_id: u32, name: &str) -> Option<(u16, u16, u32, u16)> {
     let qualified = matches!(board_id, XIAO_BASE | XIAO_SENSE) && name == "XIAO_DFU"
-        || INTERNAL_IDENTITIES.contains(&(board_id, name));
+        || INTERNAL_IDENTITIES.contains(&(board_id, name))
+        || QSPI_IDENTITIES.contains(&(board_id, name));
     if !qualified {
         return None;
     }

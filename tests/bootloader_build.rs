@@ -252,6 +252,90 @@ fn qualified_inventory_matches_release_contract() {
         ),
     ];
 
+    let qspi = [
+        (
+            BootloaderBoard::LilygoTecho,
+            0xBBA6_7475,
+            "NRF_BL_239A0029_LGTE_DFU",
+            0x00B6,
+            0x26000,
+            0x0E,
+        ),
+        (
+            BootloaderBoard::LilygoTechoLite,
+            0xDFF3_CD4E,
+            "NRF_BL_239A00DA_LTEL_DFU",
+            0x00B6,
+            0x26000,
+            0x0E,
+        ),
+        (
+            BootloaderBoard::Pca10056,
+            0x48D1_16AE,
+            "NRF_BL_239A00DA_N056_DFU",
+            0x00B6,
+            0x26000,
+            0x0E,
+        ),
+        (
+            BootloaderBoard::SensecapSolarP1,
+            0xD677_B472,
+            "NRF_BL_28860044_SCAP_DFU",
+            0x0123,
+            0x27000,
+            0x0E,
+        ),
+        (
+            BootloaderBoard::ThinknodeM1,
+            0x3F5E_2F7F,
+            "NRF_BL_239A00DA_TNM1_DFU",
+            0x00B6,
+            0x26000,
+            0x0E,
+        ),
+        (
+            BootloaderBoard::ThinknodeM6,
+            0x02D5_626D,
+            "NRF_BL_239A00DA_TNM6_DFU",
+            0x00B6,
+            0x26000,
+            0x0E,
+        ),
+        (
+            BootloaderBoard::WioTrackerL1,
+            0x2F33_6AE1,
+            "NRF_BL_28861667_WTL1_DFU",
+            0x0123,
+            0x27000,
+            0x0E,
+        ),
+        (
+            BootloaderBoard::WiscoreRak3401Rak13302W25q16,
+            0xFEF2_55E8,
+            "NRF_BL_239A0029_3401_W25Q16_DFU",
+            0x00B6,
+            0x26000,
+            0x0E,
+        ),
+        (
+            BootloaderBoard::WiscoreRak4631Rak15001SlotC,
+            0xAD73_349E,
+            "NRF_BL_239A0029_4631_15001C_DFU",
+            0x00B6,
+            0x26000,
+            0x0E,
+        ),
+        (
+            BootloaderBoard::WiscoreRak4631W25q16,
+            0x86D4_5B01,
+            "NRF_BL_239A0029_4631_W25Q16_DFU",
+            0x00B6,
+            0x26000,
+            0x0E,
+        ),
+    ];
+    let expected = expected.into_iter().chain(qspi).collect::<Vec<_>>();
+    assert_eq!(expected.len(), BOOTLOADER_BOARDS.len());
     for ((board, target_id, hw_id, fwid, app_base, storage), listed) in
         expected.into_iter().zip(BOOTLOADER_BOARDS)
     {
