@@ -69,6 +69,26 @@ enum CliBootloaderBoard {
     WiscoreRak4631Board,
     #[value(name = "wismesh_tag")]
     WismeshTag,
+    #[value(name = "lilygo_techo")]
+    LilygoTecho,
+    #[value(name = "lilygo_techo_lite")]
+    LilygoTechoLite,
+    #[value(name = "pca10056")]
+    Pca10056,
+    #[value(name = "sensecap_solar_p1")]
+    SensecapSolarP1,
+    #[value(name = "thinknode_m1")]
+    ThinknodeM1,
+    #[value(name = "thinknode_m6")]
+    ThinknodeM6,
+    #[value(name = "wio_tracker_l1")]
+    WioTrackerL1,
+    #[value(name = "wiscore_rak3401_rak13302_w25q16")]
+    WiscoreRak3401Rak13302W25q16,
+    #[value(name = "wiscore_rak4631_board_rak15001_slot_c")]
+    WiscoreRak4631BoardRak15001SlotC,
+    #[value(name = "wiscore_rak4631_w25q16")]
+    WiscoreRak4631W25q16,
 }
 
 impl CliBootloaderBoard {
@@ -92,6 +112,18 @@ impl CliBootloaderBoard {
             Self::WiscoreRak3401 => BootloaderBoard::WiscoreRak3401,
             Self::WiscoreRak4631Board => BootloaderBoard::WiscoreRak4631Board,
             Self::WismeshTag => BootloaderBoard::WismeshTag,
+            Self::LilygoTecho => BootloaderBoard::LilygoTecho,
+            Self::LilygoTechoLite => BootloaderBoard::LilygoTechoLite,
+            Self::Pca10056 => BootloaderBoard::Pca10056,
+            Self::SensecapSolarP1 => BootloaderBoard::SensecapSolarP1,
+            Self::ThinknodeM1 => BootloaderBoard::ThinknodeM1,
+            Self::ThinknodeM6 => BootloaderBoard::ThinknodeM6,
+            Self::WioTrackerL1 => BootloaderBoard::WioTrackerL1,
+            Self::WiscoreRak3401Rak13302W25q16 => BootloaderBoard::WiscoreRak3401Rak13302W25q16,
+            Self::WiscoreRak4631BoardRak15001SlotC => {
+                BootloaderBoard::WiscoreRak4631BoardRak15001SlotC
+            }
+            Self::WiscoreRak4631W25q16 => BootloaderBoard::WiscoreRak4631W25q16,
         };
         let storage = match self {
             Self::HeltecMeshTowerV2Sdcard => STORAGE_SD_UPDATE,
