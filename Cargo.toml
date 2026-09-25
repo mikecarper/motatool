@@ -28,6 +28,7 @@ serialport = { version = "4", default-features = false } # no libudev: we open b
 walkdir = "2"
 ctrlc = "3"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+zopfli = { version = "=0.8.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"

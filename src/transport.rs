@@ -3,6 +3,10 @@
 use crate::format::MAX_APPLICATION_BLOCK_SIZE;
 use flate2::{write::DeflateEncoder, Compression};
 use std::io::Write;
+use std::num::NonZeroU64;
+
+/// Match the host-side MeshCore mOTA sender's maximum-search DEFLATE setting.
+pub const ZOPFLI_ITERATIONS: u64 = 1000;
 
 /// Largest logical application block supported by MeshCore's radio OTA transport.
 pub const MAX_TRANSPORT_BLOCK_SIZE: usize = MAX_APPLICATION_BLOCK_SIZE as usize;
@@ -24,10 +28,42 @@ pub struct DeflateTransportSize {
 }
 
 /// Compress one independent raw RFC 1951 stream exactly as the live seeder does.
-pub(crate) fn deflate_raw(input: &[u8]) -> Option<Vec<u8>> {
+fn zopfli_raw(input: &[u8], iterations: u64) -> Option<Vec<u8>> {
+    let options = zopfli::Options {
+        iteration_count: NonZeroU64::new(iterations)?,
+        ..zopfli::Options::default()
+    };
+    let mut encoded = Vec::new();
+    zopfli::compress(options, zopfli::Format::Deflate, input, &mut encoded).ok()?;
+    Some(encoded)
+}
+
+fn zlib_best_raw(input: &[u8]) -> Option<Vec<u8>> {
     let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
     encoder.write_all(input).ok()?;
     encoder.finish().ok()
+}
+
+/// Search several valid independent representations. Zopfli's 1,000-pass
+/// result is the primary candidate, but its heuristic is not guaranteed to
+/// beat every earlier pass or zlib on every 2 KiB block. The shortest stream
+/// also minimizes the number of 171-byte radio DATA slices; no bytes are ever
+/// dropped from a partially filled final slice.
+pub(crate) fn deflate_raw(input: &[u8]) -> Option<Vec<u8>> {
+    let mut best = zopfli_raw(input, ZOPFLI_ITERATIONS)?;
+    for iterations in [15, 100] {
+        if let Some(candidate) = zopfli_raw(input, iterations) {
+            if candidate.len() < best.len() {
+                best = candidate;
+            }
+        }
+    }
+    if let Some(candidate) = zlib_best_raw(input) {
+        if candidate.len() < best.len() {
+            best = candidate;
+        }
+    }
+    Some(best)
 }
 
 /// Measure the v2 representation selected by the live folder seeder.

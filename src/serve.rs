@@ -12,6 +12,7 @@ use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -29,6 +30,38 @@ pub struct ServedMota {
     pub path: PathBuf,
     pub bytes: Vec<u8>,
     pub manifest: Manifest,
+    deflate_cache: Vec<OnceLock<Option<Vec<u8>>>>,
+}
+
+impl ServedMota {
+    fn raw_block(&self, block: u32) -> Option<&[u8]> {
+        if block >= self.manifest.block_count {
+            return None;
+        }
+        let block_size = self.manifest.block_size() as usize;
+        if block_size == 0 || block_size > MAX_TRANSPORT_BLOCK_SIZE {
+            return None;
+        }
+        let payload_start = self.manifest.payload_off();
+        let start = payload_start.checked_add(block as usize * block_size)?;
+        let payload_end = payload_start.checked_add(self.manifest.payload_size as usize)?;
+        let end = start.saturating_add(block_size).min(payload_end);
+        (start < end && end <= self.bytes.len()).then(|| &self.bytes[start..end])
+    }
+
+    fn cached_deflate_block(&self, block: u32) -> Option<&[u8]> {
+        let raw = self.raw_block(block)?;
+        self.deflate_cache
+            .get(block as usize)?
+            .get_or_init(|| {
+                deflate_raw(raw).filter(|encoded| {
+                    !encoded.is_empty()
+                        && encoded.len() < raw.len()
+                        && encoded.len() <= u16::MAX as usize
+                })
+            })
+            .as_deref()
+    }
 }
 
 /// Every valid `*.mota` under a folder, in a stable order (indices are how the node addresses them).
@@ -64,10 +97,12 @@ impl Folder {
                 continue;
             }
             let manifest = Manifest::parse(&bytes).expect("verified above");
+            let deflate_cache = (0..manifest.block_count).map(|_| OnceLock::new()).collect();
             motas.push(ServedMota {
                 path: path.to_path_buf(),
                 bytes,
                 manifest,
+                deflate_cache,
             });
         }
         motas.sort_by(|a, b| a.path.cmp(&b.path)); // deterministic catalog order
@@ -82,6 +117,27 @@ impl Folder {
     }
     pub fn all(&self) -> &[ServedMota] {
         &self.motas
+    }
+
+    /// Finish maximum-search host compression before opening the radio link.
+    /// Each slice request must be answered from the same cached stream, and
+    /// running 1,000 iterations inside the serial timeout would be unsafe.
+    pub fn prepare_deflate_cache(&self, mut progress: impl FnMut(usize, usize)) {
+        let total: usize = self
+            .motas
+            .iter()
+            .map(|m| m.manifest.block_count as usize)
+            .sum();
+        let mut done = 0;
+        for served in &self.motas {
+            for block in 0..served.manifest.block_count {
+                let _ = served.cached_deflate_block(block);
+                done += 1;
+                if done % 64 == 0 || done == total {
+                    progress(done, total);
+                }
+            }
+        }
     }
 }
 
@@ -161,32 +217,11 @@ impl SeederCore {
         let Some(served) = self.folder.at(index) else {
             return (STATUS_ERR, vec![]);
         };
-        if block >= served.manifest.block_count {
-            return (STATUS_ERR, vec![]);
-        }
-        let block_size = served.manifest.block_size() as usize;
-        // MeshCore's radio descriptor and receiver accept logical blocks only through 2 KiB. Reject a
-        // syntactically valid larger-container geometry before allocating/compressing attacker-sized input.
-        if block_size == 0 || block_size > MAX_TRANSPORT_BLOCK_SIZE {
-            return (STATUS_ERR, vec![]);
-        }
-        let payload_start = served.manifest.payload_off();
-        let start = match payload_start.checked_add(block as usize * block_size) {
-            Some(v) => v,
-            None => return (STATUS_ERR, vec![]),
-        };
-        let payload_end = payload_start + served.manifest.payload_size as usize;
-        let end = start.saturating_add(block_size).min(payload_end);
-        if start >= end || end > served.bytes.len() {
-            return (STATUS_ERR, vec![]);
-        }
-
-        let Some(encoded) = deflate_raw(&served.bytes[start..end]) else {
+        // MeshCore's radio descriptor and receiver accept logical blocks only through 2 KiB.
+        // The cache is populated before serving, so bounded slice requests are immediate.
+        let Some(encoded) = served.cached_deflate_block(block) else {
             return (STATUS_ERR, vec![]);
         };
-        if encoded.is_empty() || encoded.len() >= end - start || encoded.len() > u16::MAX as usize {
-            return (STATUS_ERR, vec![]);
-        }
         let Some(slice_end) = off.checked_add(len) else {
             return (STATUS_ERR, vec![]);
         };

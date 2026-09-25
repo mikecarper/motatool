@@ -91,6 +91,11 @@ The host does the compression, so the embedded seeder carries no encoder; blocks
 automatically use the negotiated 171-byte raw DATA profile. OTA-capable receiver firmware accepts stored,
 fixed-Huffman, and dynamic-Huffman DEFLATE blocks. Older nodes continue to use `READ` with legacy 1 KiB
 containers; packages intended to start on those receivers must still be built with `--block-size 1024`.
+`serve` prepares and caches every beneficial stream with Zopfli's 1,000-iteration search before it opens
+the serial/TCP link. It also compares shorter Zopfli searches and zlib's best mode per block, then uses
+the shortest lossless stream. A large folder can take several minutes to prepare, but radio slice requests
+remain immediate. `transport-size` uses that same encoder for exact packet estimates. The `.mota` container
+and its authenticated logical blocks do not change.
 Support is advertised in the existing descriptor's reserved capability byte, so newer firmware does not
 wait on operation `0x09` when connected to an older host daemon.
 

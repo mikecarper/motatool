@@ -28,10 +28,13 @@ impl From<CliPatchType> for PatchType {
         }
     }
 }
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(
@@ -154,6 +157,9 @@ struct ServeArgs {
     /// (serial only) don't auto-send `ota folder on`/`off` on the node's console.
     #[arg(long = "no-enable")]
     no_enable: bool,
+    /// (serial only) start a temporary radio window before attaching the folder.
+    #[arg(long, requires = "serial")]
+    tempradio: Option<String>,
     /// Warm-start: stage this similar build's payload into each captured .part (for `ota pull … validate`).
     #[arg(long)]
     seed: Option<String>,
@@ -504,6 +510,11 @@ fn cmd_serve(a: ServeArgs) -> Result<()> {
     }
     if folder.count() == 0 {
         eprintln!("  (nothing valid to serve)");
+    } else {
+        eprintln!("preparing raw-DEFLATE transport with Zopfli --i1000 before opening the link");
+        folder.prepare_deflate_cache(|done, total| {
+            eprintln!("  compressed {done}/{total} blocks");
+        });
     }
 
     // The same folder doubles as the pull-to-folder capture store.
@@ -535,6 +546,15 @@ fn cmd_serve(a: ServeArgs) -> Result<()> {
         let dev = a.serial.as_ref().expect("required_unless_present tcp");
         (open_serial(dev, a.baud)?, format!("{dev} @ {}", a.baud))
     };
+
+    if let Some(tuple) = &a.tempradio {
+        // ESP32 native USB/JTAG resets when the host opens the console. Wait
+        // until firmware startup finishes before issuing the temporary profile.
+        thread::sleep(Duration::from_secs(25));
+        link.write_all(format!("tempradio {tuple}\r\n").as_bytes())?;
+        link.flush()?;
+        thread::sleep(Duration::from_secs(2));
+    }
 
     let stop = Arc::new(AtomicBool::new(false));
     ctrlc::set_handler({
