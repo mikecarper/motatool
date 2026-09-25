@@ -42,6 +42,14 @@ impl Nrf52Layout {
         self.flags & NRF52_LAYOUT_FLAG_BOOTLOADER_SCRATCH != 0
     }
 
+    pub fn hybrid_ram(self) -> bool {
+        self.flags & NRF52_LAYOUT_FLAG_HYBRID_RAM != 0
+    }
+
+    pub fn auto_store(self) -> bool {
+        self.flags & NRF52_LAYOUT_FLAG_AUTO_STORE != 0
+    }
+
     /// Internal application workspace available to the currently running image.  QSPI bootloader-update
     /// builds reserve the final 0xA000 below APP_END as scratch; all other supported layouts may apply an
     /// application through APP_END (internal staging is bounded separately by `stage_ceiling`).
@@ -94,6 +102,19 @@ impl Nrf52Layout {
             !(self.external_backed() && self.uses_internal_extrafs()),
             "nRF52 external staging cannot also reserve internal ExtraFS"
         );
+        ensure!(
+            !self.auto_store() || (!self.external_backed() && !self.uses_internal_extrafs()),
+            "nRF52 adaptive staging requires an exclusive internal layout"
+        );
+        if self.hybrid_ram() {
+            ensure!(
+                !self.external_backed()
+                    && !self.uses_internal_extrafs()
+                    && self.linked_app_end == NRF52_APP_END
+                    && self.stage_ceiling == NRF52_APP_END,
+                "nRF52 hybrid RAM staging requires the exact 0xED000 internal-only profile"
+            );
+        }
         if self.bootloader_scratch() {
             ensure!(
                 self.qspi_backed()
@@ -351,5 +372,28 @@ mod tests {
         ] {
             assert!(build_nrf52_layout(layout).is_err());
         }
+    }
+
+    #[test]
+    fn rak_adaptive_layout_accepts_hybrid_internal_fallback_only() {
+        let layout = Nrf52Layout {
+            app_base: NRF52_APP_BASE_S140_V6,
+            linked_app_end: NRF52_APP_END,
+            stage_ceiling: NRF52_APP_END,
+            flags: NRF52_LAYOUT_FLAG_HYBRID_RAM | NRF52_LAYOUT_FLAG_AUTO_STORE,
+        };
+        assert_eq!(build_nrf52_layout(layout).unwrap()[9], 0x30);
+        assert!(layout.hybrid_ram() && layout.auto_store() && !layout.external_backed());
+        for flags in [
+            NRF52_LAYOUT_FLAG_AUTO_STORE | NRF52_LAYOUT_FLAG_QSPI,
+            NRF52_LAYOUT_FLAG_HYBRID_RAM | NRF52_LAYOUT_FLAG_INTERNAL_EXTRAFS,
+        ] {
+            assert!(build_nrf52_layout(Nrf52Layout { flags, ..layout }).is_err());
+        }
+        assert!(build_nrf52_layout(Nrf52Layout {
+            flags: NRF52_LAYOUT_FLAG_AUTO_STORE,
+            ..layout
+        })
+        .is_ok());
     }
 }

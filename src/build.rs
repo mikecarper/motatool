@@ -350,6 +350,30 @@ fn validate_staging_fit(plan: InplacePlan, total: usize) -> Result<()> {
     let used = u64::from(plan.memory)
         .checked_add(staged)
         .context("in-place workspace calculation overflow")?;
+    if used > u64::from(span) {
+        if let Some(layout) = plan.base_layout {
+            if layout.hybrid_ram() {
+                // The nRF52 receiver may keep up to 64 KiB of the container in
+                // retained RAM. Match its page-aligned flash/RAM split rather
+                // than charging the entire container to the flash workspace.
+                let flash_needed = page.max(total.saturating_sub(65_536));
+                let flash_len = flash_needed
+                    .checked_add(page - 1)
+                    .map(|v| v / page * page)
+                    .context("hybrid flash staging size overflow")?;
+                let flash_available = u64::from(span)
+                    .checked_sub(u64::from(plan.memory))
+                    .context("invalid nRF52 hybrid staging span")?;
+                let ram_len = total.saturating_sub(flash_len);
+                ensure!(
+                    flash_len <= flash_available && ram_len > 0 && ram_len <= 65_536,
+                    "in-place: {}-byte container exceeds authenticated hybrid flash/RAM staging",
+                    total
+                );
+                return Ok(());
+            }
+        }
+    }
     ensure!(
         used <= u64::from(span),
         "in-place: memory 0x{:X} plus the {}-byte container ({} bytes page-rounded) exceeds the authenticated staging span 0x{:X}",
@@ -428,5 +452,25 @@ mod tests {
             legacy_auto: false,
         };
         assert!(validate_staging_fit(plan, 1_000_000).is_ok());
+    }
+
+    #[test]
+    fn hybrid_layout_splits_flash_and_retained_ram() {
+        let layout = Nrf52Layout {
+            app_base: NRF52_APP_BASE_S140_V6,
+            linked_app_end: NRF52_APP_END,
+            stage_ceiling: NRF52_APP_END,
+            flags: NRF52_LAYOUT_FLAG_HYBRID_RAM | NRF52_LAYOUT_FLAG_AUTO_STORE,
+        };
+        let span = layout.stage_ceiling - layout.app_base;
+        let plan = InplacePlan {
+            memory: span - 0x1000,
+            base_layout: Some(layout),
+            legacy_auto: false,
+        };
+        assert!(validate_staging_fit(plan, 4096).is_ok());
+        assert!(validate_staging_fit(plan, 17 * 4096).is_ok());
+        assert!(validate_staging_fit(plan, 17 * 4096 + 1).is_err());
+        assert!(validate_staging_fit(plan, 18 * 4096).is_err());
     }
 }

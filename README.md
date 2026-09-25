@@ -255,6 +255,9 @@ immediately before `EndF`; motatool reads its app base, staging ceiling, and sto
 smallest safe page-aligned apply window from the complete base and target images. It also proves that an
 internal-flash container, rounded to whole erase pages, fits above that window. This avoids board-name tables
 and lets larger images such as T096 use their actual layout safely.
+Unified RAK images may carry `HYBRID_RAM|AUTO_STORE` (`0x30`): the receiver stages at least one full
+flash page above the apply window and up to 64 KiB of the container in retained RAM. The packager
+checks the same page-aligned split before emitting an in-place delta.
 
 Firmware predating the layout record retains the conservative `0x98000` window. If either image is too large
 for that fallback, the build fails with the required minimum instead of emitting a doomed patch. Use
