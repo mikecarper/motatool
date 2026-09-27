@@ -3,7 +3,8 @@ use motatool::bootloader::{
     extract_bootloader_region_from_hex, validate_bootloader_image_for_profile,
     validate_bootloader_inventory, BootloaderBoard, BootloaderBuildOpts, BOOTLOADER_BOARDS,
     CANDIDATE_MANIFEST_OFFSET, CAPS_MAGIC, CONTINUITY_MAGIC, IMAGE_SIZE, IMAGE_START,
-    MANIFEST_MAGIC, PACKAGE_SIZE, STORAGE_INTERNAL_UPDATE, STORAGE_SD_UPDATE,
+    MANIFEST_MAGIC, PACKAGE_SIZE, STORAGE_INTERNAL_UPDATE, STORAGE_RAK_AUTO_RECOVERY,
+    STORAGE_SD_UPDATE,
 };
 use motatool::crypto::ed25519_public_from_seed;
 use motatool::format::{wr_u32, BOOT_FORMAT_VER, MFLAG_BOOTLOADER, MFLAG_FULL, MFLAG_SIGNED};
@@ -25,7 +26,15 @@ fn synthetic_image(board: BootloaderBoard, storage: u8) -> Vec<u8> {
     wr_u32(&mut image, 4, IMAGE_START + 0x101);
 
     image[CAPS_OFFSET..CAPS_OFFSET + 8].copy_from_slice(&CAPS_MAGIC);
-    wr_u16(&mut image, CAPS_OFFSET + 8, 3);
+    wr_u16(
+        &mut image,
+        CAPS_OFFSET + 8,
+        if storage == STORAGE_RAK_AUTO_RECOVERY {
+            2
+        } else {
+            3
+        },
+    );
     wr_u16(&mut image, CAPS_OFFSET + 10, 0x0005);
     image[CAPS_OFFSET + 12] = storage;
     image[CAPS_OFFSET + 13..CAPS_OFFSET + 16].fill(0);
@@ -241,6 +250,22 @@ fn qualified_inventory_matches_release_contract() {
             0x00B6,
             0x0002_6000,
             0x0A,
+        ),
+        (
+            BootloaderBoard::WiscoreRak3401Auto,
+            0xD04A_B3AB,
+            "NRF_BL_239A0029_3401_AUTO_DFU",
+            0x00B6,
+            0x0002_6000,
+            0x16,
+        ),
+        (
+            BootloaderBoard::WiscoreRak4631Auto,
+            0xFEEA_FD1B,
+            "NRF_BL_239A0029_4631_AUTO_DFU",
+            0x00B6,
+            0x0002_6000,
+            0x16,
         ),
         (
             BootloaderBoard::WismeshTag,

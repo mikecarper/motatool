@@ -97,8 +97,10 @@ Every output has the strict MeshCore bootloader profile:
   `0x9FB4`, and its version must equal the signed outer version. The whole-image CRC also covers the CF2
   board configuration: do not post-process a bootloader HEX or UF2 with a CF2 patcher. Rebuild the exact
   board profile from source and package that immutable artifact.
-- Exactly one aligned `MOTABLDR` marker with apply ABI 3 or newer, both application codecs in mask `0x0005`,
-  boot-update support, no reserved bits, and the exact storage profile selected by `--board`.
+- Exactly one aligned `MOTABLDR` marker with both application codecs in mask `0x0005`,
+  no reserved bits, and the exact storage profile selected by `--board`. Self-update profiles
+  require ABI 3 or newer and boot-update support. The two adaptive RAK recovery profiles retain
+  ABI 2 and flags `0x16`; a capable MeshCore application verifies and installs these via the MBR.
 - An exact match between the selected board, embedded `(board_id, DEVICE_NAME)`, SoftDevice family/FWID,
   application base, layout ABI, storage profile, signed `target_id`, and signed `hw_id`.
 
@@ -125,6 +127,8 @@ routing identities are:
 | `thinknode_m3` | `0x239A00DA` | `0x0CA41DB2` | `NRF_BL_239A00DA_TNM3_DFU` / `TNM3_DFU` | `0x0A` internal |
 | `wiscore_rak3401` | `0x239A0029` | `0x23818A80` | `NRF_BL_239A0029_3401_DFU` / `3401_DFU` | `0x0A` internal |
 | `wiscore_rak4631_board` | `0x239A0029` | `0x2D0DF000` | `NRF_BL_239A0029_4631_DFU` / `4631_DFU` | `0x0A` internal |
+| `wiscore_rak3401_auto` | `0x239A0029` | `0xD04AB3AB` | `NRF_BL_239A0029_3401_AUTO_DFU` / `3401_AUTO_DFU` | `0x16` application recovery |
+| `wiscore_rak4631_auto` | `0x239A0029` | `0xFEEAFD1B` | `NRF_BL_239A0029_4631_AUTO_DFU` / `4631_AUTO_DFU` | `0x16` application recovery |
 | `wismesh_tag` | `0x239A0029` | `0xC72E9C9C` | `NRF_BL_239A0029_RTAG_DFU` / `RTAG_DFU` | `0x0A` internal |
 
 Generic `DEVICE_NAME` values are 1 through 15 non-space printable ASCII bytes followed by NUL padding. Their
