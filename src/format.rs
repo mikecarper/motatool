@@ -90,11 +90,13 @@ pub const NRF52_LAYOUT_FLAG_BOOTLOADER_SCRATCH: u8 = 0x08;
 /// The running application reserves a reset-retained 64 KiB SRAM arena and
 /// may split an internal container into a flash prefix and RAM suffix.
 pub const NRF52_LAYOUT_FLAG_HYBRID_RAM: u8 = 0x10;
+pub const NRF52_LAYOUT_FLAG_AUTO_STORE: u8 = 0x20;
 pub const NRF52_LAYOUT_FLAGS_KNOWN: u8 = NRF52_LAYOUT_FLAG_SD
     | NRF52_LAYOUT_FLAG_INTERNAL_EXTRAFS
     | NRF52_LAYOUT_FLAG_QSPI
     | NRF52_LAYOUT_FLAG_BOOTLOADER_SCRATCH
-    | NRF52_LAYOUT_FLAG_HYBRID_RAM;
+    | NRF52_LAYOUT_FLAG_HYBRID_RAM
+    | NRF52_LAYOUT_FLAG_AUTO_STORE;
 
 /// Reset-retained suffix capacity shared with MeshCore and OTAFIX.
 pub const NRF52_HYBRID_RAM_SIZE: u32 = 64 * 1024;

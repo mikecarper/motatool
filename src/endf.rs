@@ -1,7 +1,7 @@
 //! The `EndF` firmware-identity trailer and version/target helpers.
 //!
-//! A firmware image self-describes via a fixed 56-byte trailer the build appends: `EndF ‖ body_len(4) ‖
-//! body_hash8(8) ‖ fw_version(4) ‖ target_id(4) ‖ hw_id(32)`. `build` reads identity from here (overridable
+//! A firmware image self-describes via a fixed 56-byte trailer the build appends: `EndF || body_len(4) ||
+//! body_hash8(8) || fw_version(4) || target_id(4) || hw_id(32)`. `build` reads identity from here (overridable
 //! by flags) so a `.mota` inherits the firmware's own target/version/hardware without a filename convention.
 
 use crate::crypto::mh;
@@ -44,6 +44,10 @@ impl Nrf52Layout {
 
     pub fn hybrid_ram(self) -> bool {
         self.flags & NRF52_LAYOUT_FLAG_HYBRID_RAM != 0
+    }
+
+    pub fn auto_store(self) -> bool {
+        self.flags & NRF52_LAYOUT_FLAG_AUTO_STORE != 0
     }
 
     /// Internal application workspace available to the currently running image.  QSPI bootloader-update
@@ -99,16 +103,15 @@ impl Nrf52Layout {
             "nRF52 external staging cannot also reserve internal ExtraFS"
         );
         ensure!(
-            !(self.hybrid_ram() && self.external_backed()),
-            "nRF52 hybrid RAM staging cannot use SD or QSPI storage"
-        );
-        ensure!(
-            !(self.hybrid_ram() && self.uses_internal_extrafs()),
-            "nRF52 hybrid RAM staging cannot reserve internal ExtraFS"
+            !self.auto_store() || (!self.external_backed() && !self.uses_internal_extrafs()),
+            "nRF52 adaptive staging requires an exclusive internal layout"
         );
         if self.hybrid_ram() {
             ensure!(
-                self.linked_app_end == NRF52_APP_END && self.stage_ceiling == NRF52_APP_END,
+                !self.external_backed()
+                    && !self.uses_internal_extrafs()
+                    && self.linked_app_end == NRF52_APP_END
+                    && self.stage_ceiling == NRF52_APP_END,
                 "nRF52 hybrid RAM staging requires the exact 0xED000 internal-only profile"
             );
         }
@@ -213,7 +216,7 @@ pub fn parse_ident(image: &[u8]) -> FwIdent {
     }
 }
 
-/// Append a 56-byte EndF trailer carrying `ident` if `image` has none (idempotent — a trailed image is
+/// Append a 56-byte EndF trailer carrying `ident` if `image` has none (idempotent - a trailed image is
 /// returned unchanged). Returns the image and its 8-byte body hash.
 pub fn ensure_endf(image: &[u8], ident: &FwIdent) -> (Vec<u8>, [u8; 8]) {
     if has_endf(image) {
@@ -241,36 +244,47 @@ pub fn target_id_for_env(env: &str) -> u32 {
     rd_u32(&mh::<4>(env.as_bytes()), 0)
 }
 
-/// Pack `"a.b.c[.d]"` into a u32 (each dotted part clamped to a byte: `a<<24 | b<<16 | c<<8 | d`).
+/// Pack `"a.b.c[.d]"` into a u32 (`a<<24 | b<<16 | c<<8 | d`). Every component must fit one byte;
+/// extra components are rejected instead of being silently truncated.
 pub fn pack_version(s: &str) -> Result<u32> {
     let mut parts = [0u32; 4];
     let mut n = 0;
-    for tok in s.split('.').take(4) {
+    for tok in s.split('.') {
+        if n == parts.len() {
+            bail!("too many version components: {s:?}");
+        }
         if tok.is_empty() || !tok.bytes().all(|b| b.is_ascii_digit()) {
             bail!("bad version: {s:?}");
         }
-        parts[n] = tok
+        let value: u32 = tok
             .parse()
             .map_err(|_| anyhow::anyhow!("version component too large: {s:?}"))?;
+        if value > u8::MAX as u32 {
+            bail!("version component exceeds 255: {s:?}");
+        }
+        parts[n] = value;
         n += 1;
     }
     if n == 0 {
         bail!("bad version: {s:?}");
     }
-    Ok(((parts[0] & 0xFF) << 24)
-        | ((parts[1] & 0xFF) << 16)
-        | ((parts[2] & 0xFF) << 8)
-        | (parts[3] & 0xFF))
+    Ok((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3])
 }
 
-/// Render the packed version as `"major.minor.patch"` (the prerelease byte is not shown).
+/// Render the packed version, including a nonzero fourth byte.
 pub fn version_str(v: u32) -> String {
-    format!(
+    let core = format!(
         "{}.{}.{}",
         (v >> 24) & 0xFF,
         (v >> 16) & 0xFF,
         (v >> 8) & 0xFF
-    )
+    );
+    let fourth = v & 0xFF;
+    if fourth == 0 {
+        core
+    } else {
+        format!("{core}.{fourth}")
+    }
 }
 
 #[cfg(test)]
@@ -281,9 +295,13 @@ mod tests {
     fn version_roundtrip() {
         assert_eq!(pack_version("1.17.0").unwrap(), 0x0111_0000);
         assert_eq!(version_str(0x0111_0000), "1.17.0");
+        assert_eq!(pack_version("1.17.1.02").unwrap(), 0x0111_0102);
+        assert_eq!(version_str(0x0111_0102), "1.17.1.2");
         assert!(pack_version("1..2").is_err());
         assert!(pack_version("").is_err());
         assert!(pack_version("1.2.x").is_err());
+        assert!(pack_version("256.2.3").is_err());
+        assert!(pack_version("1.2.3.4.5").is_err());
     }
 
     #[test]
@@ -375,17 +393,28 @@ mod tests {
     }
 
     #[test]
-    fn nrf52_hybrid_layout_roundtrips() {
+    fn rak_adaptive_layout_accepts_hybrid_internal_fallback_only() {
         let layout = Nrf52Layout {
             app_base: NRF52_APP_BASE_S140_V6,
             linked_app_end: NRF52_APP_END,
             stage_ceiling: NRF52_APP_END,
-            flags: NRF52_LAYOUT_FLAG_HYBRID_RAM,
+            flags: NRF52_LAYOUT_FLAG_HYBRID_RAM | NRF52_LAYOUT_FLAG_AUTO_STORE,
         };
+        assert_eq!(build_nrf52_layout(layout).unwrap()[9], 0x30);
+        assert!(layout.hybrid_ram() && layout.auto_store() && !layout.external_backed());
+        for flags in [
+            NRF52_LAYOUT_FLAG_AUTO_STORE | NRF52_LAYOUT_FLAG_QSPI,
+            NRF52_LAYOUT_FLAG_HYBRID_RAM | NRF52_LAYOUT_FLAG_INTERNAL_EXTRAFS,
+        ] {
+            assert!(build_nrf52_layout(Nrf52Layout { flags, ..layout }).is_err());
+        }
+        assert!(build_nrf52_layout(Nrf52Layout {
+            flags: NRF52_LAYOUT_FLAG_AUTO_STORE,
+            ..layout
+        })
+        .is_ok());
         let record = build_nrf52_layout(layout).unwrap();
         let (image, _) = ensure_endf(&record, &FwIdent::default());
         assert_eq!(parse_nrf52_layout(&image).unwrap(), Some(layout));
-        assert!(layout.hybrid_ram());
-        assert!(!layout.external_backed());
     }
 }

@@ -5,8 +5,15 @@
 //! bootloader image.  These checks mirror MeshCore's `tools/mota/motalib.py` package parser so `verify`
 //! and folder serving cannot turn an arbitrary signed blob into a bootloader offer.
 
-use crate::crypto::sha256;
-use anyhow::{ensure, Context, Result};
+use crate::build::Built;
+use crate::crypto::{ed25519_public_from_seed, ed25519_sign, sha256};
+use crate::format::{
+    off, wr_u32, Codec, Manifest, APPROVAL_NONE, BOOTLOADER_BLOCK_SIZE, BOOT_FORMAT_VER,
+    HASH_ALGO_SHA256, HEADER_LEN, HW_ID_LEN, MAGIC, MFL, MFLAG_BOOTLOADER, MFLAG_FULL,
+    MFLAG_SIGNED, SIGNED_LEN, TRAILER, TRAILER_LEN,
+};
+use crate::merkle;
+use anyhow::{bail, ensure, Context, Result};
 
 pub const IMAGE_START: u32 = 0x000F_4000;
 pub const IMAGE_SIZE: usize = 0x0000_A000;
@@ -19,15 +26,19 @@ pub const CONTINUITY_SIZE: usize = 32;
 pub const ENVELOPE_SIZE: usize = MANIFEST_SIZE + CONTINUITY_SIZE;
 pub const CANDIDATE_MANIFEST_OFFSET: usize = IMAGE_SIZE - ENVELOPE_SIZE;
 pub const CAPS_MAGIC: [u8; 8] = *b"MOTABLDR";
+pub const BLOCK_COUNT: usize = IMAGE_SIZE / BOOTLOADER_BLOCK_SIZE as usize;
+pub const PACKAGE_SIZE: usize = HEADER_LEN + MFL + BLOCK_COUNT * 4 + IMAGE_SIZE + TRAILER_LEN;
 
 pub const STORAGE_SD: u8 = 0x01;
 pub const STORAGE_STAGE_CEILING: u8 = 0x02;
 pub const STORAGE_QSPI: u8 = 0x04;
 pub const STORAGE_UPDATE: u8 = 0x08;
-pub const STORAGE_KNOWN: u8 = 0x0F;
+pub const STORAGE_HEADER_W25: u8 = 0x10;
+pub const STORAGE_KNOWN: u8 = 0x1F;
 pub const STORAGE_SD_UPDATE: u8 = STORAGE_SD | STORAGE_UPDATE;
 pub const STORAGE_QSPI_UPDATE: u8 = STORAGE_STAGE_CEILING | STORAGE_QSPI | STORAGE_UPDATE;
 pub const STORAGE_INTERNAL_UPDATE: u8 = STORAGE_STAGE_CEILING | STORAGE_UPDATE;
+pub const STORAGE_RAK_AUTO_RECOVERY: u8 = STORAGE_STAGE_CEILING | STORAGE_QSPI | STORAGE_HEADER_W25;
 
 const REQUIRED_FORMAT_ABI: u16 = 3;
 const REQUIRED_APP_CODEC_MASK: u16 = (1 << 0) | (1 << 2); // FULL | DETOOLS_INPLACE
@@ -40,7 +51,339 @@ const LAYOUT_ABI: u16 = 1;
 const XIAO_BASE: u32 = 0x2886_0044;
 const XIAO_SENSE: u32 = 0x2886_0045;
 
+/// Exact OTAFIX bootloader identities qualified for package creation.
+///
+/// Board ID alone is not an identity because several boards share a vendor ID.
+/// Every selection is bound to the complete embedded device name as well.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootloaderBoard {
+    XiaoNrf52840Ble,
+    XiaoNrf52840BleSense,
+    Gat562,
+    HeltecMeshTowerV2,
+    HeltecMeshPocket,
+    HeltecT096,
+    HeltecT1,
+    HeltecT114,
+    KeepteenLt1,
+    MinewsemiMx25le01,
+    PromicroNrf52840,
+    T1000E,
+    ThinknodeM3,
+    WiscoreRak3401,
+    WiscoreRak4631Board,
+    WiscoreRak3401Auto,
+    WiscoreRak4631Auto,
+    WismeshTag,
+    LilygoTecho,
+    LilygoTechoLite,
+    Pca10056,
+    SensecapSolarP1,
+    ThinknodeM1,
+    ThinknodeM6,
+    WioTrackerL1,
+    WiscoreRak3401Rak13302W25q16,
+    WiscoreRak4631BoardRak15001SlotC,
+    WiscoreRak4631W25q16,
+}
+
+pub const BOOTLOADER_BOARDS: [BootloaderBoard; 28] = [
+    BootloaderBoard::XiaoNrf52840Ble,
+    BootloaderBoard::XiaoNrf52840BleSense,
+    BootloaderBoard::Gat562,
+    BootloaderBoard::HeltecMeshTowerV2,
+    BootloaderBoard::HeltecMeshPocket,
+    BootloaderBoard::HeltecT096,
+    BootloaderBoard::HeltecT1,
+    BootloaderBoard::HeltecT114,
+    BootloaderBoard::KeepteenLt1,
+    BootloaderBoard::MinewsemiMx25le01,
+    BootloaderBoard::PromicroNrf52840,
+    BootloaderBoard::T1000E,
+    BootloaderBoard::ThinknodeM3,
+    BootloaderBoard::WiscoreRak3401,
+    BootloaderBoard::WiscoreRak4631Board,
+    BootloaderBoard::WiscoreRak3401Auto,
+    BootloaderBoard::WiscoreRak4631Auto,
+    BootloaderBoard::WismeshTag,
+    BootloaderBoard::LilygoTecho,
+    BootloaderBoard::LilygoTechoLite,
+    BootloaderBoard::Pca10056,
+    BootloaderBoard::SensecapSolarP1,
+    BootloaderBoard::ThinknodeM1,
+    BootloaderBoard::ThinknodeM6,
+    BootloaderBoard::WioTrackerL1,
+    BootloaderBoard::WiscoreRak3401Rak13302W25q16,
+    BootloaderBoard::WiscoreRak4631BoardRak15001SlotC,
+    BootloaderBoard::WiscoreRak4631W25q16,
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BootloaderCompatibility {
+    pub softdevice_family: u16,
+    pub softdevice_fwid: u16,
+    pub app_base: u32,
+    pub layout_abi: u16,
+}
+
+impl BootloaderBoard {
+    pub const fn board_id(self) -> u32 {
+        match self {
+            Self::XiaoNrf52840Ble => XIAO_BASE,
+            Self::XiaoNrf52840BleSense => XIAO_SENSE,
+            Self::HeltecMeshTowerV2
+            | Self::HeltecMeshPocket
+            | Self::HeltecT096
+            | Self::HeltecT1
+            | Self::HeltecT114 => 0x239A_0071,
+            Self::KeepteenLt1 | Self::PromicroNrf52840 => 0x239A_00B3,
+            Self::Gat562
+            | Self::LilygoTecho
+            | Self::WiscoreRak3401Rak13302W25q16
+            | Self::WiscoreRak4631BoardRak15001SlotC
+            | Self::WiscoreRak4631W25q16
+            | Self::MinewsemiMx25le01
+            | Self::WiscoreRak3401
+            | Self::WiscoreRak4631Board
+            | Self::WiscoreRak3401Auto
+            | Self::WiscoreRak4631Auto
+            | Self::WismeshTag => 0x239A_0029,
+            Self::T1000E => 0x2886_0057,
+            Self::SensecapSolarP1 => 0x2886_0044,
+            Self::WioTrackerL1 => 0x2886_1667,
+            Self::ThinknodeM3
+            | Self::LilygoTechoLite
+            | Self::Pca10056
+            | Self::ThinknodeM1
+            | Self::ThinknodeM6 => 0x239A_00DA,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::XiaoNrf52840Ble => "xiao_nrf52840_ble",
+            Self::XiaoNrf52840BleSense => "xiao_nrf52840_ble_sense",
+            Self::Gat562 => "gat562",
+            Self::HeltecMeshTowerV2 => "heltec_mesh_tower_v2",
+            Self::HeltecMeshPocket => "heltec_mesh_pocket",
+            Self::HeltecT096 => "heltec_t096",
+            Self::HeltecT1 => "heltec_t1",
+            Self::HeltecT114 => "heltec_t114",
+            Self::KeepteenLt1 => "keepteen_lt1",
+            Self::MinewsemiMx25le01 => "minewsemi_mx25le01",
+            Self::PromicroNrf52840 => "promicro_nrf52840",
+            Self::T1000E => "t1000_e",
+            Self::ThinknodeM3 => "thinknode_m3",
+            Self::WiscoreRak3401 => "wiscore_rak3401",
+            Self::WiscoreRak4631Board => "wiscore_rak4631_board",
+            Self::WiscoreRak3401Auto => "wiscore_rak3401_auto",
+            Self::WiscoreRak4631Auto => "wiscore_rak4631_auto",
+            Self::WismeshTag => "wismesh_tag",
+            Self::LilygoTecho => "lilygo_techo",
+            Self::LilygoTechoLite => "lilygo_techo_lite",
+            Self::Pca10056 => "pca10056",
+            Self::SensecapSolarP1 => "sensecap_solar_p1",
+            Self::ThinknodeM1 => "thinknode_m1",
+            Self::ThinknodeM6 => "thinknode_m6",
+            Self::WioTrackerL1 => "wio_tracker_l1",
+            Self::WiscoreRak3401Rak13302W25q16 => "wiscore_rak3401_rak13302_w25q16",
+            Self::WiscoreRak4631BoardRak15001SlotC => "wiscore_rak4631_board_rak15001_slot_c",
+            Self::WiscoreRak4631W25q16 => "wiscore_rak4631_w25q16",
+        }
+    }
+
+    pub const fn device_name(self) -> &'static str {
+        match self {
+            Self::XiaoNrf52840Ble | Self::XiaoNrf52840BleSense => "XIAO_DFU",
+            Self::Gat562 => "GAT562_DFU",
+            Self::HeltecMeshTowerV2 => "TOWER_V2_OTA",
+            Self::HeltecMeshPocket => "MESH_POCKET_OTA",
+            Self::HeltecT096 => "T096_DFU",
+            Self::HeltecT1 => "T1_DFU",
+            Self::HeltecT114 => "T114_DFU",
+            Self::KeepteenLt1 => "KeepteenLT1_OTA",
+            Self::MinewsemiMx25le01 => "MX25_DFU",
+            Self::PromicroNrf52840 => "PROM_DFU",
+            Self::T1000E => "T1KE_DFU",
+            Self::ThinknodeM3 => "TNM3_DFU",
+            Self::WiscoreRak3401 => "3401_DFU",
+            Self::WiscoreRak4631Board => "4631_DFU",
+            Self::WiscoreRak3401Auto => "3401_AUTO_DFU",
+            Self::WiscoreRak4631Auto => "4631_AUTO_DFU",
+            Self::WismeshTag => "RTAG_DFU",
+            Self::LilygoTecho => "LGTE_DFU",
+            Self::LilygoTechoLite => "LTEL_DFU",
+            Self::Pca10056 => "N056_DFU",
+            Self::SensecapSolarP1 => "SCAP_DFU",
+            Self::ThinknodeM1 => "TNM1_DFU",
+            Self::ThinknodeM6 => "TNM6_DFU",
+            Self::WioTrackerL1 => "WTL1_DFU",
+            Self::WiscoreRak3401Rak13302W25q16 => "3401_W25Q16_DFU",
+            Self::WiscoreRak4631BoardRak15001SlotC => "4631_15001C_DFU",
+            Self::WiscoreRak4631W25q16 => "4631_W25Q16_DFU",
+        }
+    }
+
+    pub const fn storage_profile(self) -> u8 {
+        match self {
+            Self::XiaoNrf52840Ble
+            | Self::XiaoNrf52840BleSense
+            | Self::LilygoTecho
+            | Self::LilygoTechoLite
+            | Self::Pca10056
+            | Self::SensecapSolarP1
+            | Self::ThinknodeM1
+            | Self::ThinknodeM6
+            | Self::WioTrackerL1
+            | Self::WiscoreRak3401Rak13302W25q16
+            | Self::WiscoreRak4631BoardRak15001SlotC
+            | Self::WiscoreRak4631W25q16 => STORAGE_QSPI_UPDATE,
+            Self::WiscoreRak3401Auto | Self::WiscoreRak4631Auto => STORAGE_RAK_AUTO_RECOVERY,
+            _ => STORAGE_INTERNAL_UPDATE,
+        }
+    }
+
+    pub const fn accepts_storage_profile(self, profile: u8) -> bool {
+        match self {
+            Self::HeltecMeshTowerV2 => {
+                profile == STORAGE_INTERNAL_UPDATE || profile == STORAGE_SD_UPDATE
+            }
+            _ => profile == self.storage_profile(),
+        }
+    }
+
+    pub const fn profile_name(self, profile: u8) -> Option<&'static str> {
+        match (self, profile) {
+            (Self::HeltecMeshTowerV2, STORAGE_SD_UPDATE) => Some("heltec_mesh_tower_v2_sdcard"),
+            _ if profile == self.storage_profile() => Some(self.name()),
+            _ => None,
+        }
+    }
+
+    pub const fn compatibility(self) -> BootloaderCompatibility {
+        match self {
+            Self::XiaoNrf52840Ble
+            | Self::XiaoNrf52840BleSense
+            | Self::MinewsemiMx25le01
+            | Self::T1000E
+            | Self::SensecapSolarP1
+            | Self::WioTrackerL1 => BootloaderCompatibility {
+                softdevice_family: FAMILY_S140,
+                softdevice_fwid: S140_V7_FWID,
+                app_base: APP_BASE_S140_V7,
+                layout_abi: LAYOUT_ABI,
+            },
+            _ => BootloaderCompatibility {
+                softdevice_family: FAMILY_S140,
+                softdevice_fwid: S140_V6_FWID,
+                app_base: APP_BASE_S140_V6,
+                layout_abi: LAYOUT_ABI,
+            },
+        }
+    }
+
+    pub fn hw_id(self) -> [u8; HW_ID_LEN] {
+        bootloader_hw_id(self.board_id(), self.device_name())
+            .expect("qualified bootloader identity must have a canonical hw_id")
+    }
+
+    pub fn hw_id_str(self) -> String {
+        let value = self.hw_id();
+        let end = value
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(value.len());
+        std::str::from_utf8(&value[..end])
+            .expect("qualified bootloader hw_id must be ASCII")
+            .to_owned()
+    }
+
+    pub fn target_id(self) -> u32 {
+        bootloader_target_id(self.board_id(), self.device_name())
+            .expect("qualified bootloader identity must have a target ID")
+    }
+
+    pub fn from_identity(board_id: u32, device_name: &str) -> Option<Self> {
+        BOOTLOADER_BOARDS
+            .into_iter()
+            .find(|board| board.board_id() == board_id && board.device_name() == device_name)
+    }
+}
+
+/// Validate the checked-in builder inventory before trusting its derived routes.
+pub fn validate_bootloader_inventory() -> Result<()> {
+    for (index, board) in BOOTLOADER_BOARDS.iter().copied().enumerate() {
+        let hw_id = board.hw_id();
+        let target_id = board.target_id();
+        ensure!(
+            !matches!(target_id, 0 | u32::MAX),
+            "invalid bootloader target ID for {}",
+            board.name()
+        );
+        ensure!(
+            qualified_storage(board.board_id(), board.device_name())
+                .contains(&board.storage_profile()),
+            "invalid bootloader storage inventory for {}",
+            board.name()
+        );
+        let compatibility = board.compatibility();
+        ensure!(
+            qualified_platform(board.board_id(), board.device_name())
+                == Some((
+                    compatibility.softdevice_family,
+                    compatibility.softdevice_fwid,
+                    compatibility.app_base,
+                    compatibility.layout_abi,
+                )),
+            "invalid bootloader platform inventory for {}",
+            board.name()
+        );
+        if let Some(application) = crate::targets::env_name(target_id) {
+            bail!(
+                "bootloader target ID 0x{target_id:08X} for {} collides with application target {application}",
+                board.name()
+            );
+        }
+        for other in BOOTLOADER_BOARDS[index + 1..].iter().copied() {
+            ensure!(
+                (board.board_id(), board.device_name()) != (other.board_id(), other.device_name()),
+                "duplicate bootloader identity: {} and {}",
+                board.name(),
+                other.name()
+            );
+            ensure!(
+                hw_id != other.hw_id(),
+                "bootloader hw_id collision: {} and {}",
+                board.name(),
+                other.name()
+            );
+            ensure!(
+                target_id != other.target_id(),
+                "bootloader target ID collision: {} and {}",
+                board.name(),
+                other.name()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Render the OTAFIX version encoded in BLM2 continuity metadata.
+pub fn bootloader_version_str(version: u32) -> String {
+    let base = format!(
+        "{}.{}.{}",
+        (version >> 24) & 0xFF,
+        (version >> 16) & 0xFF,
+        (version >> 8) & 0xFF
+    );
+    match version & 0xFF {
+        0xFF => base,
+        preview => format!("{base}-preview.{preview}"),
+    }
+}
+
 const INTERNAL_IDENTITIES: &[(u32, &str)] = &[
+    (0x239A_0029, "GAT562_DFU"),
     (0x239A_0071, "TOWER_V2_OTA"),
     (0x239A_0071, "T096_DFU"),
     (0x239A_0071, "T1_DFU"),
@@ -54,12 +397,28 @@ const INTERNAL_IDENTITIES: &[(u32, &str)] = &[
     (0x239A_0029, "3401_DFU"),
     (0x239A_0029, "4631_DFU"),
     (0x239A_0029, "RTAG_DFU"),
+    (0x239A_0029, "LGTE_DFU"),
+    (0x239A_00DA, "LTEL_DFU"),
+    (0x239A_00DA, "N056_DFU"),
+    (0x2886_0044, "SCAP_DFU"),
+    (0x239A_00DA, "TNM1_DFU"),
+    (0x239A_00DA, "TNM6_DFU"),
+    (0x2886_1667, "WTL1_DFU"),
+    (0x239A_0029, "3401_W25Q16_DFU"),
+    (0x239A_0029, "4631_15001C_DFU"),
+    (0x239A_0029, "4631_W25Q16_DFU"),
+];
+const RAK_AUTO_RECOVERY_IDENTITIES: &[(u32, &str)] = &[
+    (0x239A_0029, "3401_AUTO_DFU"),
+    (0x239A_0029, "4631_AUTO_DFU"),
 ];
 const S140_V7_IDENTITIES: &[(u32, &str)] = &[
     (XIAO_BASE, "XIAO_DFU"),
     (XIAO_SENSE, "XIAO_DFU"),
     (0x239A_0029, "MX25_DFU"),
     (0x2886_0057, "T1KE_DFU"),
+    (0x2886_0044, "SCAP_DFU"),
+    (0x2886_1667, "WTL1_DFU"),
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,6 +434,16 @@ pub struct BootloaderIdentity {
     pub storage_flags: u8,
 }
 
+pub struct BootloaderBuildOpts {
+    /// Exact padded bytes for IMAGE_START through IMAGE_START + IMAGE_SIZE.
+    pub image: Vec<u8>,
+    pub board: BootloaderBoard,
+    /// Exact successor storage profile selected by the operator.
+    pub storage_profile: u8,
+    /// Bootloader packages must always be signed.
+    pub sign_seed: [u8; 32],
+}
+
 pub fn version_valid(version: u32) -> bool {
     version != 0 && version != u32::MAX && version & 0xFF != 0
 }
@@ -87,9 +456,9 @@ pub fn bootloader_hw_id(board_id: u32, device_name: &str) -> Result<[u8; 32]> {
                 .is_some_and(|parsed| parsed == device_name),
         "invalid embedded bootloader board/name identity"
     );
-    let text = match board_id {
-        XIAO_BASE => "XIAO_BL_28860044".to_owned(),
-        XIAO_SENSE => "XIAO_BL_28860045".to_owned(),
+    let text = match (board_id, device_name) {
+        (XIAO_BASE, "XIAO_DFU") => "XIAO_BL_28860044".to_owned(),
+        (XIAO_SENSE, "XIAO_DFU") => "XIAO_BL_28860045".to_owned(),
         _ => format!("NRF_BL_{board_id:08X}_{device_name}"),
     };
     ensure!(
@@ -102,7 +471,7 @@ pub fn bootloader_hw_id(board_id: u32, device_name: &str) -> Result<[u8; 32]> {
 }
 
 pub fn bootloader_target_id(board_id: u32, device_name: &str) -> Result<u32> {
-    if matches!(board_id, XIAO_BASE | XIAO_SENSE) {
+    if matches!(board_id, XIAO_BASE | XIAO_SENSE) && device_name == "XIAO_DFU" {
         return Ok(board_id);
     }
     let hw = bootloader_hw_id(board_id, device_name)?;
@@ -140,11 +509,11 @@ pub fn validate_bootloader_image(
     );
 
     let storage = capability_storage(image)
-        .context("bootloader lacks one unambiguous ABI 3 self-update capability marker")?;
+        .context("bootloader lacks one unambiguous qualified update/recovery marker")?;
     let allowed = qualified_storage(embedded.board_id, &embedded.device_name);
     ensure!(
         allowed.contains(&storage),
-        "bootloader self-update storage profile 0x{storage:02X} is not valid for its identity"
+        "bootloader update/recovery storage profile 0x{storage:02X} is not valid for its identity"
     );
 
     if let Some(expected) = qualified_platform(embedded.board_id, &embedded.device_name) {
@@ -166,6 +535,59 @@ pub fn validate_bootloader_image(
     })
 }
 
+/// Validate an image against an explicitly selected release profile.
+pub fn validate_bootloader_image_for_profile(
+    image: &[u8],
+    board: BootloaderBoard,
+    storage_profile: u8,
+) -> Result<BootloaderIdentity> {
+    validate_bootloader_inventory()?;
+    ensure!(
+        board.accepts_storage_profile(storage_profile),
+        "storage profile 0x{storage_profile:02X} is not valid for {}",
+        board.name()
+    );
+    ensure!(
+        image.len() == IMAGE_SIZE,
+        "bootloader image must be exactly {IMAGE_SIZE} bytes"
+    );
+    validate_vector(image)?;
+    let parsed = parse_identity(image)?;
+    ensure!(
+        parsed.board_id == board.board_id() && parsed.device_name == board.device_name(),
+        "embedded bootloader identity does not match selected board {}",
+        board.name()
+    );
+    let identity = validate_bootloader_image(
+        image,
+        board.target_id(),
+        &board.hw_id(),
+        parsed.boot_version,
+    )?;
+    ensure!(
+        identity.storage_flags == storage_profile,
+        "embedded storage profile 0x{:02X} does not match selected profile 0x{storage_profile:02X}",
+        identity.storage_flags
+    );
+    let compatibility = board.compatibility();
+    ensure!(
+        (
+            identity.softdevice_family,
+            identity.softdevice_fwid,
+            identity.app_base,
+            identity.layout_abi,
+        ) == (
+            compatibility.softdevice_family,
+            compatibility.softdevice_fwid,
+            compatibility.app_base,
+            compatibility.layout_abi,
+        ),
+        "embedded continuity metadata does not match selected board {}",
+        board.name()
+    );
+    Ok(identity)
+}
+
 fn padded_name(name: &[u8]) -> Result<[u8; 16]> {
     ensure!(name.len() <= 15, "bootloader device name exceeds 15 bytes");
     let mut out = [0u8; 16];
@@ -177,8 +599,8 @@ fn valid_device_name(board_id: u32, raw: &[u8; 16]) -> Option<&str> {
     if matches!(board_id, 0 | u32::MAX) {
         return None;
     }
-    if matches!(board_id, XIAO_BASE | XIAO_SENSE) {
-        return (raw == b"XIAO_DFU\0\0\0\0\0\0\0\0").then_some("XIAO_DFU");
+    if matches!(board_id, XIAO_BASE | XIAO_SENSE) && raw == b"XIAO_DFU\0\0\0\0\0\0\0\0" {
+        return Some("XIAO_DFU");
     }
     let end = raw.iter().position(|&b| b == 0)?;
     if end == 0
@@ -288,11 +710,17 @@ fn capability_storage(image: &[u8]) -> Option<u8> {
         let abi = rd_u16(image, off + 8);
         let codecs = rd_u16(image, off + 10);
         let storage = image[off + 12];
-        if abi < REQUIRED_FORMAT_ABI
+        if abi
+            < (if storage == STORAGE_RAK_AUTO_RECOVERY {
+                2
+            } else {
+                REQUIRED_FORMAT_ABI
+            })
             || abi == u16::MAX
             || codecs & REQUIRED_APP_CODEC_MASK != REQUIRED_APP_CODEC_MASK
             || storage & !STORAGE_KNOWN != 0
-            || storage & STORAGE_UPDATE == 0
+            || (storage & STORAGE_HEADER_W25 != 0 && storage != STORAGE_RAK_AUTO_RECOVERY)
+            || (storage & STORAGE_UPDATE == 0 && storage != STORAGE_RAK_AUTO_RECOVERY)
             || image[off + 13..off + 16] != [0, 0, 0]
         {
             continue;
@@ -303,7 +731,10 @@ fn capability_storage(image: &[u8]) -> Option<u8> {
         }
         if matches!(
             storage,
-            STORAGE_SD_UPDATE | STORAGE_QSPI_UPDATE | STORAGE_INTERNAL_UPDATE
+            STORAGE_SD_UPDATE
+                | STORAGE_QSPI_UPDATE
+                | STORAGE_INTERNAL_UPDATE
+                | STORAGE_RAK_AUTO_RECOVERY
         ) {
             found = Some(storage);
         }
@@ -315,7 +746,24 @@ fn qualified_storage(board_id: u32, name: &str) -> &'static [u8] {
     const INTERNAL: &[u8] = &[STORAGE_INTERNAL_UPDATE];
     const QSPI: &[u8] = &[STORAGE_QSPI_UPDATE];
     const TOWER: &[u8] = &[STORAGE_INTERNAL_UPDATE, STORAGE_SD_UPDATE];
+    const RAK_AUTO: &[u8] = &[STORAGE_RAK_AUTO_RECOVERY];
     if matches!(board_id, XIAO_BASE | XIAO_SENSE) && name == "XIAO_DFU" {
+        QSPI
+    } else if RAK_AUTO_RECOVERY_IDENTITIES.contains(&(board_id, name)) {
+        RAK_AUTO
+    } else if matches!(
+        (board_id, name),
+        (0x239A_0029, "LGTE_DFU")
+            | (0x239A_00DA, "LTEL_DFU")
+            | (0x239A_00DA, "N056_DFU")
+            | (0x2886_0044, "SCAP_DFU")
+            | (0x239A_00DA, "TNM1_DFU")
+            | (0x239A_00DA, "TNM6_DFU")
+            | (0x2886_1667, "WTL1_DFU")
+            | (0x239A_0029, "3401_W25Q16_DFU")
+            | (0x239A_0029, "4631_15001C_DFU")
+            | (0x239A_0029, "4631_W25Q16_DFU")
+    ) {
         QSPI
     } else if board_id == 0x239A_0071 && name == "TOWER_V2_OTA" {
         TOWER
@@ -328,7 +776,8 @@ fn qualified_storage(board_id: u32, name: &str) -> &'static [u8] {
 
 fn qualified_platform(board_id: u32, name: &str) -> Option<(u16, u16, u32, u16)> {
     let qualified = matches!(board_id, XIAO_BASE | XIAO_SENSE) && name == "XIAO_DFU"
-        || INTERNAL_IDENTITIES.contains(&(board_id, name));
+        || INTERNAL_IDENTITIES.contains(&(board_id, name))
+        || RAK_AUTO_RECOVERY_IDENTITIES.contains(&(board_id, name));
     if !qualified {
         return None;
     }
@@ -337,6 +786,139 @@ fn qualified_platform(board_id: u32, name: &str) -> Option<(u16, u16, u32, u16)>
         (FAMILY_S140, S140_V7_FWID, APP_BASE_S140_V7, LAYOUT_ABI)
     } else {
         (FAMILY_S140, S140_V6_FWID, APP_BASE_S140_V6, LAYOUT_ABI)
+    })
+}
+
+/// Extract the exact bootloader-copy region from an OTAFIX Intel HEX file.
+/// Data outside the region is ignored and holes are filled with erased bytes.
+pub fn extract_bootloader_region_from_hex(bytes: &[u8]) -> Result<Vec<u8>> {
+    use ihex::Record;
+
+    let text = std::str::from_utf8(bytes).context("Intel HEX is not valid UTF-8")?;
+    let mut image = vec![0xFF; IMAGE_SIZE];
+    let mut written = vec![false; IMAGE_SIZE];
+    let mut base = 0u32;
+    let mut saw_region_data = false;
+    let mut saw_eof = false;
+
+    for record in ihex::Reader::new(text) {
+        match record.context("malformed Intel HEX record")? {
+            Record::Data { offset, value } => {
+                let address = base
+                    .checked_add(u32::from(offset))
+                    .context("Intel HEX data address overflow")?;
+                let end = address
+                    .checked_add(value.len() as u32)
+                    .context("Intel HEX data range overflow")?;
+                let copy_start = address.max(IMAGE_START);
+                let copy_end = end.min(IMAGE_START + IMAGE_SIZE as u32);
+                if copy_start < copy_end {
+                    saw_region_data = true;
+                    let source = (copy_start - address) as usize;
+                    let destination = (copy_start - IMAGE_START) as usize;
+                    let length = (copy_end - copy_start) as usize;
+                    for index in 0..length {
+                        let byte = value[source + index];
+                        if written[destination + index] && image[destination + index] != byte {
+                            bail!(
+                                "conflicting Intel HEX data at address 0x{:08X}",
+                                copy_start + index as u32
+                            );
+                        }
+                        image[destination + index] = byte;
+                        written[destination + index] = true;
+                    }
+                }
+            }
+            Record::ExtendedLinearAddress(upper) => base = u32::from(upper) << 16,
+            Record::ExtendedSegmentAddress(segment) => base = u32::from(segment) << 4,
+            Record::EndOfFile => {
+                saw_eof = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    ensure!(saw_eof, "Intel HEX missing EOF record");
+    ensure!(
+        saw_region_data,
+        "Intel HEX contains no data in bootloader region 0x{IMAGE_START:08X}..0x{:08X}",
+        IMAGE_START + IMAGE_SIZE as u32
+    );
+    Ok(image)
+}
+
+/// Calculate the embedded bootloader CRC with its four-byte field zeroed.
+pub fn bootloader_image_crc32(image: &[u8], crc_offset: usize) -> u32 {
+    crc32_with_zeroed(image, crc_offset..crc_offset.saturating_add(4))
+}
+
+/// Build a signed, exact-board format-3 bootloader package.
+pub fn build_bootloader(options: &BootloaderBuildOpts) -> Result<Built> {
+    let identity = validate_bootloader_image_for_profile(
+        &options.image,
+        options.board,
+        options.storage_profile,
+    )?;
+    let leaves = merkle::leaf_hashes(&options.image, BOOTLOADER_BLOCK_SIZE as usize);
+    ensure!(
+        leaves.len() == BLOCK_COUNT,
+        "bootloader payload must yield exactly {BLOCK_COUNT} blocks"
+    );
+    let root = merkle::root(&leaves);
+    let image_hash = sha256(&options.image);
+
+    let mut manifest_bytes = [0u8; MFL];
+    manifest_bytes[off::FORMAT_VER] = BOOT_FORMAT_VER;
+    manifest_bytes[off::FLAGS] = MFLAG_FULL | MFLAG_SIGNED | MFLAG_BOOTLOADER;
+    manifest_bytes[off::HASH_ALGO] = HASH_ALGO_SHA256;
+    wr_u32(
+        &mut manifest_bytes,
+        off::TARGET_ID,
+        options.board.target_id(),
+    );
+    wr_u32(&mut manifest_bytes, off::FW_VERSION, identity.boot_version);
+    wr_u32(&mut manifest_bytes, off::IMAGE_SIZE, IMAGE_SIZE as u32);
+    wr_u32(&mut manifest_bytes, off::PAYLOAD_SIZE, IMAGE_SIZE as u32);
+    manifest_bytes[off::BLOCK_SIZE_LOG2] = BOOTLOADER_BLOCK_SIZE.ilog2() as u8;
+    manifest_bytes[off::MERKLE_ROOT..off::MERKLE_ROOT + root.len()].copy_from_slice(&root);
+    manifest_bytes[off::IMAGE_HASH..off::IMAGE_HASH + image_hash.len()]
+        .copy_from_slice(&image_hash);
+    manifest_bytes[off::CODEC_ID] = Codec::Full as u8;
+    manifest_bytes[off::HW_ID..off::HW_ID + HW_ID_LEN].copy_from_slice(&options.board.hw_id());
+    manifest_bytes[off::SIGNER..off::SIGNER + 32]
+        .copy_from_slice(&ed25519_public_from_seed(&options.sign_seed));
+    let signature = ed25519_sign(&options.sign_seed, &manifest_bytes[..SIGNED_LEN]);
+    manifest_bytes[off::SIGNATURE..off::SIGNATURE + signature.len()].copy_from_slice(&signature);
+    manifest_bytes[off::APPROVAL..off::APPROVAL + APPROVAL_NONE.len()]
+        .copy_from_slice(&APPROVAL_NONE);
+
+    let leaves_bytes: Vec<u8> = leaves.into_iter().flatten().collect();
+    let mut bytes = Vec::with_capacity(PACKAGE_SIZE);
+    bytes.extend_from_slice(&MAGIC);
+    bytes.extend_from_slice(&(PACKAGE_SIZE as u32).to_le_bytes());
+    bytes.extend_from_slice(&manifest_bytes);
+    bytes.extend_from_slice(&leaves_bytes);
+    bytes.extend_from_slice(&options.image);
+    bytes.extend_from_slice(&TRAILER);
+    ensure!(
+        bytes.len() == PACKAGE_SIZE,
+        "bootloader package geometry drifted from {PACKAGE_SIZE} bytes"
+    );
+
+    let manifest = Manifest::parse(&bytes)?;
+    let suggested_name = format!(
+        "{}_v{}_bootloader_{}.mota",
+        options.board.hw_id_str(),
+        bootloader_version_str(identity.boot_version),
+        hex::encode_upper(root)
+    );
+    Ok(Built {
+        bytes,
+        suggested_name,
+        manifest,
+        inplace_memory: None,
     })
 }
 

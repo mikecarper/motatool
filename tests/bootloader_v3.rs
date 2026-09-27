@@ -161,9 +161,39 @@ fn signed_t096_v3_parses_verifies_inspects_and_serves() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("BOOTLOADER=true"), "{stdout}");
+    assert!(stdout.contains("package_kind   : bootloader"), "{stdout}");
+    assert!(
+        stdout.contains("target_id      : 0x42354c85  (heltec_t096)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("fw_version     : 2.4.4-preview.1  (0x02040401)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("bootloader_profile: heltec_t096"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("bootloader_offset: 0x9fb4"), "{stdout}");
     assert!(stdout.contains("bootloader_board: 0x239a0071"), "{stdout}");
     assert!(stdout.contains("bootloader_name : T096_DFU"), "{stdout}");
+    assert!(
+        stdout.contains("bootloader_version: 2.4.4-preview.1"),
+        "{stdout}"
+    );
     assert!(stdout.contains("bootloader_store: 0x0a"), "{stdout}");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_motatool"))
+        .arg("verify")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("[heltec_t096] v2.4.4-preview.1"),
+        "{stdout}"
+    );
 }
 
 fn v2_with_bootloader_flag(m: &mut [u8]) {

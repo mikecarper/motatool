@@ -492,4 +492,24 @@ mod tests {
         };
         assert!(validate_staging_fit(plan, 0x1000).is_ok());
     }
+
+    #[test]
+    fn adaptive_hybrid_layout_splits_flash_and_retained_ram() {
+        let layout = Nrf52Layout {
+            app_base: NRF52_APP_BASE_S140_V6,
+            linked_app_end: NRF52_APP_END,
+            stage_ceiling: NRF52_APP_END,
+            flags: NRF52_LAYOUT_FLAG_HYBRID_RAM | NRF52_LAYOUT_FLAG_AUTO_STORE,
+        };
+        let span = layout.stage_ceiling - layout.app_base;
+        let plan = InplacePlan {
+            memory: span - 0x1000,
+            base_layout: Some(layout),
+            legacy_auto: false,
+        };
+        assert!(validate_staging_fit(plan, 4096).is_ok());
+        assert!(validate_staging_fit(plan, 17 * 4096).is_ok());
+        assert!(validate_staging_fit(plan, 17 * 4096 + 1).is_err());
+        assert!(validate_staging_fit(plan, 18 * 4096).is_err());
+    }
 }
