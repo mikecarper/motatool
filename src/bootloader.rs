@@ -33,10 +33,12 @@ pub const STORAGE_SD: u8 = 0x01;
 pub const STORAGE_STAGE_CEILING: u8 = 0x02;
 pub const STORAGE_QSPI: u8 = 0x04;
 pub const STORAGE_UPDATE: u8 = 0x08;
-pub const STORAGE_KNOWN: u8 = 0x0F;
+pub const STORAGE_HEADER_W25: u8 = 0x10;
+pub const STORAGE_KNOWN: u8 = 0x1F;
 pub const STORAGE_SD_UPDATE: u8 = STORAGE_SD | STORAGE_UPDATE;
 pub const STORAGE_QSPI_UPDATE: u8 = STORAGE_STAGE_CEILING | STORAGE_QSPI | STORAGE_UPDATE;
 pub const STORAGE_INTERNAL_UPDATE: u8 = STORAGE_STAGE_CEILING | STORAGE_UPDATE;
+pub const STORAGE_RAK_AUTO_RECOVERY: u8 = STORAGE_STAGE_CEILING | STORAGE_QSPI | STORAGE_HEADER_W25;
 
 const REQUIRED_FORMAT_ABI: u16 = 3;
 const REQUIRED_APP_CODEC_MASK: u16 = (1 << 0) | (1 << 2); // FULL | DETOOLS_INPLACE
@@ -70,6 +72,8 @@ pub enum BootloaderBoard {
     ThinknodeM3,
     WiscoreRak3401,
     WiscoreRak4631Board,
+    WiscoreRak3401Auto,
+    WiscoreRak4631Auto,
     WismeshTag,
     LilygoTecho,
     LilygoTechoLite,
@@ -83,7 +87,7 @@ pub enum BootloaderBoard {
     WiscoreRak4631W25q16,
 }
 
-pub const BOOTLOADER_BOARDS: [BootloaderBoard; 26] = [
+pub const BOOTLOADER_BOARDS: [BootloaderBoard; 28] = [
     BootloaderBoard::XiaoNrf52840Ble,
     BootloaderBoard::XiaoNrf52840BleSense,
     BootloaderBoard::Gat562,
@@ -99,6 +103,8 @@ pub const BOOTLOADER_BOARDS: [BootloaderBoard; 26] = [
     BootloaderBoard::ThinknodeM3,
     BootloaderBoard::WiscoreRak3401,
     BootloaderBoard::WiscoreRak4631Board,
+    BootloaderBoard::WiscoreRak3401Auto,
+    BootloaderBoard::WiscoreRak4631Auto,
     BootloaderBoard::WismeshTag,
     BootloaderBoard::LilygoTecho,
     BootloaderBoard::LilygoTechoLite,
@@ -139,6 +145,8 @@ impl BootloaderBoard {
             | Self::MinewsemiMx25le01
             | Self::WiscoreRak3401
             | Self::WiscoreRak4631Board
+            | Self::WiscoreRak3401Auto
+            | Self::WiscoreRak4631Auto
             | Self::WismeshTag => 0x239A_0029,
             Self::T1000E => 0x2886_0057,
             Self::SensecapSolarP1 => 0x2886_0044,
@@ -168,6 +176,8 @@ impl BootloaderBoard {
             Self::ThinknodeM3 => "thinknode_m3",
             Self::WiscoreRak3401 => "wiscore_rak3401",
             Self::WiscoreRak4631Board => "wiscore_rak4631_board",
+            Self::WiscoreRak3401Auto => "wiscore_rak3401_auto",
+            Self::WiscoreRak4631Auto => "wiscore_rak4631_auto",
             Self::WismeshTag => "wismesh_tag",
             Self::LilygoTecho => "lilygo_techo",
             Self::LilygoTechoLite => "lilygo_techo_lite",
@@ -198,6 +208,8 @@ impl BootloaderBoard {
             Self::ThinknodeM3 => "TNM3_DFU",
             Self::WiscoreRak3401 => "3401_DFU",
             Self::WiscoreRak4631Board => "4631_DFU",
+            Self::WiscoreRak3401Auto => "3401_AUTO_DFU",
+            Self::WiscoreRak4631Auto => "4631_AUTO_DFU",
             Self::WismeshTag => "RTAG_DFU",
             Self::LilygoTecho => "LGTE_DFU",
             Self::LilygoTechoLite => "LTEL_DFU",
@@ -226,6 +238,7 @@ impl BootloaderBoard {
             | Self::WiscoreRak3401Rak13302W25q16
             | Self::WiscoreRak4631BoardRak15001SlotC
             | Self::WiscoreRak4631W25q16 => STORAGE_QSPI_UPDATE,
+            Self::WiscoreRak3401Auto | Self::WiscoreRak4631Auto => STORAGE_RAK_AUTO_RECOVERY,
             _ => STORAGE_INTERNAL_UPDATE,
         }
     }
@@ -395,6 +408,10 @@ const INTERNAL_IDENTITIES: &[(u32, &str)] = &[
     (0x239A_0029, "4631_15001C_DFU"),
     (0x239A_0029, "4631_W25Q16_DFU"),
 ];
+const RAK_AUTO_RECOVERY_IDENTITIES: &[(u32, &str)] = &[
+    (0x239A_0029, "3401_AUTO_DFU"),
+    (0x239A_0029, "4631_AUTO_DFU"),
+];
 const S140_V7_IDENTITIES: &[(u32, &str)] = &[
     (XIAO_BASE, "XIAO_DFU"),
     (XIAO_SENSE, "XIAO_DFU"),
@@ -492,11 +509,11 @@ pub fn validate_bootloader_image(
     );
 
     let storage = capability_storage(image)
-        .context("bootloader lacks one unambiguous ABI 3 self-update capability marker")?;
+        .context("bootloader lacks one unambiguous qualified update/recovery marker")?;
     let allowed = qualified_storage(embedded.board_id, &embedded.device_name);
     ensure!(
         allowed.contains(&storage),
-        "bootloader self-update storage profile 0x{storage:02X} is not valid for its identity"
+        "bootloader update/recovery storage profile 0x{storage:02X} is not valid for its identity"
     );
 
     if let Some(expected) = qualified_platform(embedded.board_id, &embedded.device_name) {
@@ -693,11 +710,17 @@ fn capability_storage(image: &[u8]) -> Option<u8> {
         let abi = rd_u16(image, off + 8);
         let codecs = rd_u16(image, off + 10);
         let storage = image[off + 12];
-        if abi < REQUIRED_FORMAT_ABI
+        if abi
+            < (if storage == STORAGE_RAK_AUTO_RECOVERY {
+                2
+            } else {
+                REQUIRED_FORMAT_ABI
+            })
             || abi == u16::MAX
             || codecs & REQUIRED_APP_CODEC_MASK != REQUIRED_APP_CODEC_MASK
             || storage & !STORAGE_KNOWN != 0
-            || storage & STORAGE_UPDATE == 0
+            || (storage & STORAGE_HEADER_W25 != 0 && storage != STORAGE_RAK_AUTO_RECOVERY)
+            || (storage & STORAGE_UPDATE == 0 && storage != STORAGE_RAK_AUTO_RECOVERY)
             || image[off + 13..off + 16] != [0, 0, 0]
         {
             continue;
@@ -708,7 +731,10 @@ fn capability_storage(image: &[u8]) -> Option<u8> {
         }
         if matches!(
             storage,
-            STORAGE_SD_UPDATE | STORAGE_QSPI_UPDATE | STORAGE_INTERNAL_UPDATE
+            STORAGE_SD_UPDATE
+                | STORAGE_QSPI_UPDATE
+                | STORAGE_INTERNAL_UPDATE
+                | STORAGE_RAK_AUTO_RECOVERY
         ) {
             found = Some(storage);
         }
@@ -720,8 +746,11 @@ fn qualified_storage(board_id: u32, name: &str) -> &'static [u8] {
     const INTERNAL: &[u8] = &[STORAGE_INTERNAL_UPDATE];
     const QSPI: &[u8] = &[STORAGE_QSPI_UPDATE];
     const TOWER: &[u8] = &[STORAGE_INTERNAL_UPDATE, STORAGE_SD_UPDATE];
+    const RAK_AUTO: &[u8] = &[STORAGE_RAK_AUTO_RECOVERY];
     if matches!(board_id, XIAO_BASE | XIAO_SENSE) && name == "XIAO_DFU" {
         QSPI
+    } else if RAK_AUTO_RECOVERY_IDENTITIES.contains(&(board_id, name)) {
+        RAK_AUTO
     } else if matches!(
         (board_id, name),
         (0x239A_0029, "LGTE_DFU")
@@ -747,7 +776,8 @@ fn qualified_storage(board_id: u32, name: &str) -> &'static [u8] {
 
 fn qualified_platform(board_id: u32, name: &str) -> Option<(u16, u16, u32, u16)> {
     let qualified = matches!(board_id, XIAO_BASE | XIAO_SENSE) && name == "XIAO_DFU"
-        || INTERNAL_IDENTITIES.contains(&(board_id, name));
+        || INTERNAL_IDENTITIES.contains(&(board_id, name))
+        || RAK_AUTO_RECOVERY_IDENTITIES.contains(&(board_id, name));
     if !qualified {
         return None;
     }

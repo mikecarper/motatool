@@ -67,6 +67,10 @@ enum CliBootloaderBoard {
     WiscoreRak3401,
     #[value(name = "wiscore_rak4631_board")]
     WiscoreRak4631Board,
+    #[value(name = "wiscore_rak3401_auto")]
+    WiscoreRak3401Auto,
+    #[value(name = "wiscore_rak4631_auto")]
+    WiscoreRak4631Auto,
     #[value(name = "wismesh_tag")]
     WismeshTag,
     #[value(name = "lilygo_techo")]
@@ -111,6 +115,8 @@ impl CliBootloaderBoard {
             Self::ThinknodeM3 => BootloaderBoard::ThinknodeM3,
             Self::WiscoreRak3401 => BootloaderBoard::WiscoreRak3401,
             Self::WiscoreRak4631Board => BootloaderBoard::WiscoreRak4631Board,
+            Self::WiscoreRak3401Auto => BootloaderBoard::WiscoreRak3401Auto,
+            Self::WiscoreRak4631Auto => BootloaderBoard::WiscoreRak4631Auto,
             Self::WismeshTag => BootloaderBoard::WismeshTag,
             Self::LilygoTecho => BootloaderBoard::LilygoTecho,
             Self::LilygoTechoLite => BootloaderBoard::LilygoTechoLite,
