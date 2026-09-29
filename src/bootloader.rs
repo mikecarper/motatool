@@ -75,6 +75,8 @@ pub enum BootloaderBoard {
     WiscoreRak4631Board,
     WiscoreRak3401Auto,
     WiscoreRak4631Auto,
+    WiscoreRak3401AutoRecovery,
+    WiscoreRak4631AutoRecovery,
     WismeshTag,
     LilygoTecho,
     LilygoTechoLite,
@@ -88,7 +90,7 @@ pub enum BootloaderBoard {
     WiscoreRak4631W25q16,
 }
 
-pub const BOOTLOADER_BOARDS: [BootloaderBoard; 28] = [
+pub const BOOTLOADER_BOARDS: [BootloaderBoard; 30] = [
     BootloaderBoard::XiaoNrf52840Ble,
     BootloaderBoard::XiaoNrf52840BleSense,
     BootloaderBoard::Gat562,
@@ -106,6 +108,8 @@ pub const BOOTLOADER_BOARDS: [BootloaderBoard; 28] = [
     BootloaderBoard::WiscoreRak4631Board,
     BootloaderBoard::WiscoreRak3401Auto,
     BootloaderBoard::WiscoreRak4631Auto,
+    BootloaderBoard::WiscoreRak3401AutoRecovery,
+    BootloaderBoard::WiscoreRak4631AutoRecovery,
     BootloaderBoard::WismeshTag,
     BootloaderBoard::LilygoTecho,
     BootloaderBoard::LilygoTechoLite,
@@ -148,6 +152,8 @@ impl BootloaderBoard {
             | Self::WiscoreRak4631Board
             | Self::WiscoreRak3401Auto
             | Self::WiscoreRak4631Auto
+            | Self::WiscoreRak3401AutoRecovery
+            | Self::WiscoreRak4631AutoRecovery
             | Self::WismeshTag => 0x239A_0029,
             Self::T1000E => 0x2886_0057,
             Self::SensecapSolarP1 => 0x2886_0044,
@@ -179,6 +185,8 @@ impl BootloaderBoard {
             Self::WiscoreRak4631Board => "wiscore_rak4631_board",
             Self::WiscoreRak3401Auto => "wiscore_rak3401_auto",
             Self::WiscoreRak4631Auto => "wiscore_rak4631_auto",
+            Self::WiscoreRak3401AutoRecovery => "wiscore_rak3401_auto_recovery",
+            Self::WiscoreRak4631AutoRecovery => "wiscore_rak4631_auto_recovery",
             Self::WismeshTag => "wismesh_tag",
             Self::LilygoTecho => "lilygo_techo",
             Self::LilygoTechoLite => "lilygo_techo_lite",
@@ -211,6 +219,8 @@ impl BootloaderBoard {
             Self::WiscoreRak4631Board => "4631_DFU",
             Self::WiscoreRak3401Auto => "3401_DFU",
             Self::WiscoreRak4631Auto => "4631_DFU",
+            Self::WiscoreRak3401AutoRecovery => "3401_AUTO_DFU",
+            Self::WiscoreRak4631AutoRecovery => "4631_AUTO_DFU",
             Self::WismeshTag => "RTAG_DFU",
             Self::LilygoTecho => "LGTE_DFU",
             Self::LilygoTechoLite => "LTEL_DFU",
@@ -549,7 +559,10 @@ pub fn validate_bootloader_image(
         ensure!(
             storage == STORAGE_INTERNAL_UPDATE
                 && embedded.board_id == 0x239A_0029
-                && matches!(embedded.device_name.as_str(), "3401_DFU" | "4631_DFU"),
+                && matches!(
+                    embedded.device_name.as_str(),
+                    "3401_DFU" | "4631_DFU" | "3401_AUTO_DFU" | "4631_AUTO_DFU"
+                ),
             "optional RAK application storage requires the deployed board identity"
         );
     }
@@ -619,7 +632,10 @@ pub fn validate_bootloader_image_for_profile(
     )?;
     if matches!(
         board,
-        BootloaderBoard::WiscoreRak3401Auto | BootloaderBoard::WiscoreRak4631Auto
+        BootloaderBoard::WiscoreRak3401Auto
+            | BootloaderBoard::WiscoreRak4631Auto
+            | BootloaderBoard::WiscoreRak3401AutoRecovery
+            | BootloaderBoard::WiscoreRak4631AutoRecovery
     ) {
         ensure!(
             optional_application_storage(image)?,
@@ -828,7 +844,11 @@ fn qualified_storage(board_id: u32, name: &str) -> &'static [u8] {
     const INTERNAL: &[u8] = &[STORAGE_INTERNAL_UPDATE];
     const QSPI: &[u8] = &[STORAGE_QSPI_UPDATE];
     const TOWER: &[u8] = &[STORAGE_INTERNAL_UPDATE, STORAGE_SD_UPDATE];
-    const RAK_AUTO: &[u8] = &[STORAGE_RAK_AUTO_RECOVERY, STORAGE_RAK_AUTO_UPDATE];
+    const RAK_AUTO: &[u8] = &[
+        STORAGE_RAK_AUTO_RECOVERY,
+        STORAGE_RAK_AUTO_UPDATE,
+        STORAGE_INTERNAL_UPDATE,
+    ];
     if matches!(board_id, XIAO_BASE | XIAO_SENSE) && name == "XIAO_DFU" {
         QSPI
     } else if RAK_AUTO_RECOVERY_IDENTITIES.contains(&(board_id, name)) {

@@ -27,7 +27,10 @@ fn synthetic_image(board: BootloaderBoard, storage: u8) -> Vec<u8> {
     if storage == STORAGE_RAK_AUTO_UPDATE
         || matches!(
             board,
-            BootloaderBoard::WiscoreRak3401Auto | BootloaderBoard::WiscoreRak4631Auto
+            BootloaderBoard::WiscoreRak3401Auto
+                | BootloaderBoard::WiscoreRak4631Auto
+                | BootloaderBoard::WiscoreRak3401AutoRecovery
+                | BootloaderBoard::WiscoreRak4631AutoRecovery
         )
     {
         wr_u32(&mut image, 0, 0x2003_0000);
@@ -317,6 +320,22 @@ fn qualified_inventory_matches_release_contract() {
             BootloaderBoard::WiscoreRak4631Auto,
             0x2D0D_F000,
             "NRF_BL_239A0029_4631_DFU",
+            0x00B6,
+            0x0002_6000,
+            0x0A,
+        ),
+        (
+            BootloaderBoard::WiscoreRak3401AutoRecovery,
+            0xD04A_B3AB,
+            "NRF_BL_239A0029_3401_AUTO_DFU",
+            0x00B6,
+            0x0002_6000,
+            0x0A,
+        ),
+        (
+            BootloaderBoard::WiscoreRak4631AutoRecovery,
+            0xFEEA_FD1B,
+            "NRF_BL_239A0029_4631_AUTO_DFU",
             0x00B6,
             0x0002_6000,
             0x0A,
