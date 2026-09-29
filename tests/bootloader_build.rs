@@ -4,7 +4,7 @@ use motatool::bootloader::{
     validate_bootloader_inventory, BootloaderBoard, BootloaderBuildOpts, BOOTLOADER_BOARDS,
     CANDIDATE_MANIFEST_OFFSET, CAPS_MAGIC, CONTINUITY_MAGIC, IMAGE_SIZE, IMAGE_START,
     MANIFEST_MAGIC, PACKAGE_SIZE, STORAGE_INTERNAL_UPDATE, STORAGE_RAK_AUTO_RECOVERY,
-    STORAGE_SD_UPDATE,
+    STORAGE_RAK_AUTO_UPDATE, STORAGE_SD_UPDATE,
 };
 use motatool::crypto::ed25519_public_from_seed;
 use motatool::format::{wr_u32, BOOT_FORMAT_VER, MFLAG_BOOTLOADER, MFLAG_FULL, MFLAG_SIGNED};
@@ -24,6 +24,18 @@ fn synthetic_image(board: BootloaderBoard, storage: u8) -> Vec<u8> {
     let mut image = vec![0xFF; IMAGE_SIZE];
     wr_u32(&mut image, 0, 0x2004_0000);
     wr_u32(&mut image, 4, IMAGE_START + 0x101);
+    if storage == STORAGE_RAK_AUTO_UPDATE
+        || matches!(
+            board,
+            BootloaderBoard::WiscoreRak3401Auto | BootloaderBoard::WiscoreRak4631Auto
+        )
+    {
+        wr_u32(&mut image, 0, 0x2003_0000);
+        image[0x90..0xA0].copy_from_slice(b"MOTARAMA\x01\x00\x48\x00\x00\x00\x01\x00");
+        if storage == STORAGE_INTERNAL_UPDATE {
+            image[0xA0..0xB0].copy_from_slice(b"MOTASTOR\x01\x00\x10\x00\x14\x00\x00\x00");
+        }
+    }
 
     image[CAPS_OFFSET..CAPS_OFFSET + 8].copy_from_slice(&CAPS_MAGIC);
     wr_u16(
@@ -120,6 +132,48 @@ fn selected_board_and_storage_profile_are_enforced() {
         STORAGE_INTERNAL_UPDATE
     )
     .is_err());
+}
+
+#[test]
+fn compatible_rak_preserves_legacy_identity_and_optional_storage() {
+    for (current, legacy) in [
+        (
+            BootloaderBoard::WiscoreRak3401Auto,
+            BootloaderBoard::WiscoreRak3401,
+        ),
+        (
+            BootloaderBoard::WiscoreRak4631Auto,
+            BootloaderBoard::WiscoreRak4631Board,
+        ),
+    ] {
+        assert_eq!(current.hw_id(), legacy.hw_id());
+        assert_eq!(current.target_id(), legacy.target_id());
+        assert_eq!(
+            BootloaderBoard::from_identity(current.board_id(), current.device_name()),
+            Some(current)
+        );
+        let image = synthetic_image(current, STORAGE_INTERNAL_UPDATE);
+        validate_bootloader_image_for_profile(&image, legacy, STORAGE_INTERNAL_UPDATE).unwrap();
+        // Selecting the adaptive profile requires the separate application marker.
+        let old = synthetic_image(legacy, STORAGE_INTERNAL_UPDATE);
+        assert!(
+            validate_bootloader_image_for_profile(&old, current, STORAGE_INTERNAL_UPDATE).is_err()
+        );
+        for offset in [0xA8, 0xAA, 0xAC, 0xAD] {
+            let mut invalid = image.clone();
+            invalid[offset] ^= 1;
+            let crc_offset = CANDIDATE_MANIFEST_OFFSET + 40;
+            invalid[crc_offset..crc_offset + 4].fill(0);
+            let crc = bootloader_image_crc32(&invalid, crc_offset);
+            wr_u32(&mut invalid, crc_offset, crc);
+            assert!(validate_bootloader_image_for_profile(
+                &invalid,
+                current,
+                STORAGE_INTERNAL_UPDATE
+            )
+            .is_err());
+        }
+    }
 }
 
 #[test]
@@ -253,19 +307,19 @@ fn qualified_inventory_matches_release_contract() {
         ),
         (
             BootloaderBoard::WiscoreRak3401Auto,
-            0xD04A_B3AB,
-            "NRF_BL_239A0029_3401_AUTO_DFU",
+            0x2381_8A80,
+            "NRF_BL_239A0029_3401_DFU",
             0x00B6,
             0x0002_6000,
-            0x16,
+            0x0A,
         ),
         (
             BootloaderBoard::WiscoreRak4631Auto,
-            0xFEEA_FD1B,
-            "NRF_BL_239A0029_4631_AUTO_DFU",
+            0x2D0D_F000,
+            "NRF_BL_239A0029_4631_DFU",
             0x00B6,
             0x0002_6000,
-            0x16,
+            0x0A,
         ),
         (
             BootloaderBoard::WismeshTag,

@@ -39,6 +39,7 @@ pub const STORAGE_SD_UPDATE: u8 = STORAGE_SD | STORAGE_UPDATE;
 pub const STORAGE_QSPI_UPDATE: u8 = STORAGE_STAGE_CEILING | STORAGE_QSPI | STORAGE_UPDATE;
 pub const STORAGE_INTERNAL_UPDATE: u8 = STORAGE_STAGE_CEILING | STORAGE_UPDATE;
 pub const STORAGE_RAK_AUTO_RECOVERY: u8 = STORAGE_STAGE_CEILING | STORAGE_QSPI | STORAGE_HEADER_W25;
+pub const STORAGE_RAK_AUTO_UPDATE: u8 = STORAGE_RAK_AUTO_RECOVERY | STORAGE_UPDATE;
 
 const REQUIRED_FORMAT_ABI: u16 = 3;
 const REQUIRED_APP_CODEC_MASK: u16 = (1 << 0) | (1 << 2); // FULL | DETOOLS_INPLACE
@@ -208,8 +209,8 @@ impl BootloaderBoard {
             Self::ThinknodeM3 => "TNM3_DFU",
             Self::WiscoreRak3401 => "3401_DFU",
             Self::WiscoreRak4631Board => "4631_DFU",
-            Self::WiscoreRak3401Auto => "3401_AUTO_DFU",
-            Self::WiscoreRak4631Auto => "4631_AUTO_DFU",
+            Self::WiscoreRak3401Auto => "3401_DFU",
+            Self::WiscoreRak4631Auto => "4631_DFU",
             Self::WismeshTag => "RTAG_DFU",
             Self::LilygoTecho => "LGTE_DFU",
             Self::LilygoTechoLite => "LTEL_DFU",
@@ -238,7 +239,6 @@ impl BootloaderBoard {
             | Self::WiscoreRak3401Rak13302W25q16
             | Self::WiscoreRak4631BoardRak15001SlotC
             | Self::WiscoreRak4631W25q16 => STORAGE_QSPI_UPDATE,
-            Self::WiscoreRak3401Auto | Self::WiscoreRak4631Auto => STORAGE_RAK_AUTO_RECOVERY,
             _ => STORAGE_INTERNAL_UPDATE,
         }
     }
@@ -304,6 +304,14 @@ impl BootloaderBoard {
     }
 
     pub fn from_identity(board_id: u32, device_name: &str) -> Option<Self> {
+        // Display the canonical release choice for the preserved RAK identity.
+        if board_id == 0x239A_0029 {
+            match device_name {
+                "3401_DFU" => return Some(Self::WiscoreRak3401Auto),
+                "4631_DFU" => return Some(Self::WiscoreRak4631Auto),
+                _ => {}
+            }
+        }
         BOOTLOADER_BOARDS
             .into_iter()
             .find(|board| board.board_id() == board_id && board.device_name() == device_name)
@@ -345,6 +353,27 @@ pub fn validate_bootloader_inventory() -> Result<()> {
             );
         }
         for other in BOOTLOADER_BOARDS[index + 1..].iter().copied() {
+            // These source/build aliases deliberately preserve the deployed
+            // board identity. Releases publish only the unified auto selection.
+            if matches!(
+                (board, other),
+                (
+                    BootloaderBoard::WiscoreRak3401,
+                    BootloaderBoard::WiscoreRak3401Auto
+                ) | (
+                    BootloaderBoard::WiscoreRak4631Board,
+                    BootloaderBoard::WiscoreRak4631Auto
+                )
+            ) {
+                ensure!(
+                    hw_id == other.hw_id()
+                        && target_id == other.target_id()
+                        && board.storage_profile() == other.storage_profile()
+                        && board.compatibility() == other.compatibility(),
+                    "RAK compatible alias changed its deployed contract"
+                );
+                continue;
+            }
             ensure!(
                 (board.board_id(), board.device_name()) != (other.board_id(), other.device_name()),
                 "duplicate bootloader identity: {} and {}",
@@ -515,6 +544,30 @@ pub fn validate_bootloader_image(
         allowed.contains(&storage),
         "bootloader update/recovery storage profile 0x{storage:02X} is not valid for its identity"
     );
+    let optional_storage = optional_application_storage(image)?;
+    if optional_storage {
+        ensure!(
+            storage == STORAGE_INTERNAL_UPDATE
+                && embedded.board_id == 0x239A_0029
+                && matches!(embedded.device_name.as_str(), "3401_DFU" | "4631_DFU"),
+            "optional RAK application storage requires the deployed board identity"
+        );
+    }
+    if storage == STORAGE_RAK_AUTO_UPDATE || optional_storage {
+        const RAM_CAPS: &[u8; 16] = b"MOTARAMA\x01\x00\x48\x00\x00\x00\x01\x00";
+        let markers = image
+            .chunks_exact(4)
+            .enumerate()
+            .filter(|(i, _)| {
+                let offset = i * 4;
+                image.get(offset..offset + 16) == Some(RAM_CAPS.as_slice())
+            })
+            .count();
+        ensure!(
+            markers == 1 && rd_u32(image, 0) <= 0x2003_0000,
+            "adaptive bootloader must retain its 64 KiB hybrid RAM arena"
+        );
+    }
 
     if let Some(expected) = qualified_platform(embedded.board_id, &embedded.device_name) {
         let actual = (
@@ -564,6 +617,15 @@ pub fn validate_bootloader_image_for_profile(
         &board.hw_id(),
         parsed.boot_version,
     )?;
+    if matches!(
+        board,
+        BootloaderBoard::WiscoreRak3401Auto | BootloaderBoard::WiscoreRak4631Auto
+    ) {
+        ensure!(
+            optional_application_storage(image)?,
+            "unified RAK image lacks optional application storage capability"
+        );
+    }
     ensure!(
         identity.storage_flags == storage_profile,
         "embedded storage profile 0x{:02X} does not match selected profile 0x{storage_profile:02X}",
@@ -700,6 +762,23 @@ fn parse_identity(image: &[u8]) -> Result<BootloaderIdentity> {
     })
 }
 
+fn optional_application_storage(image: &[u8]) -> Result<bool> {
+    const RECORD: &[u8; 32] =
+        b"MOTARAMA\x01\x00\x48\x00\x00\x00\x01\x00MOTASTOR\x01\x00\x10\x00\x14\x00\x00\x00";
+    let mut count = 0;
+    for off in (0..image.len().saturating_sub(7)).step_by(4) {
+        if image.get(off..off + 8) != Some(b"MOTASTOR".as_slice()) {
+            continue;
+        }
+        count += 1;
+        ensure!(
+            count == 1 && off >= 16 && image.get(off - 16..off + 16) == Some(RECORD.as_slice()),
+            "optional RAK application storage marker is invalid or ambiguous"
+        );
+    }
+    Ok(count == 1)
+}
+
 fn capability_storage(image: &[u8]) -> Option<u8> {
     let mut found = None;
     let mut valid_count = 0u8;
@@ -719,7 +798,9 @@ fn capability_storage(image: &[u8]) -> Option<u8> {
             || abi == u16::MAX
             || codecs & REQUIRED_APP_CODEC_MASK != REQUIRED_APP_CODEC_MASK
             || storage & !STORAGE_KNOWN != 0
-            || (storage & STORAGE_HEADER_W25 != 0 && storage != STORAGE_RAK_AUTO_RECOVERY)
+            || (storage & STORAGE_HEADER_W25 != 0
+                && storage != STORAGE_RAK_AUTO_RECOVERY
+                && storage != STORAGE_RAK_AUTO_UPDATE)
             || (storage & STORAGE_UPDATE == 0 && storage != STORAGE_RAK_AUTO_RECOVERY)
             || image[off + 13..off + 16] != [0, 0, 0]
         {
@@ -735,6 +816,7 @@ fn capability_storage(image: &[u8]) -> Option<u8> {
                 | STORAGE_QSPI_UPDATE
                 | STORAGE_INTERNAL_UPDATE
                 | STORAGE_RAK_AUTO_RECOVERY
+                | STORAGE_RAK_AUTO_UPDATE
         ) {
             found = Some(storage);
         }
@@ -746,7 +828,7 @@ fn qualified_storage(board_id: u32, name: &str) -> &'static [u8] {
     const INTERNAL: &[u8] = &[STORAGE_INTERNAL_UPDATE];
     const QSPI: &[u8] = &[STORAGE_QSPI_UPDATE];
     const TOWER: &[u8] = &[STORAGE_INTERNAL_UPDATE, STORAGE_SD_UPDATE];
-    const RAK_AUTO: &[u8] = &[STORAGE_RAK_AUTO_RECOVERY];
+    const RAK_AUTO: &[u8] = &[STORAGE_RAK_AUTO_RECOVERY, STORAGE_RAK_AUTO_UPDATE];
     if matches!(board_id, XIAO_BASE | XIAO_SENSE) && name == "XIAO_DFU" {
         QSPI
     } else if RAK_AUTO_RECOVERY_IDENTITIES.contains(&(board_id, name)) {
