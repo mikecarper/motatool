@@ -92,6 +92,94 @@ fn build_for(board: BootloaderBoard, storage: u8) -> motatool::Built {
     .unwrap()
 }
 
+fn tower_combined_image() -> Vec<u8> {
+    let mut image = synthetic_image(BootloaderBoard::HeltecMeshTowerV2, STORAGE_SD_UPDATE);
+    wr_u32(&mut image, 0, 0x2003_0000);
+    image[0x90..0xB0].copy_from_slice(
+        b"MOTARAMA\x01\x00\x48\x00\x00\x00\x01\x00MOTASTOR\x01\x00\x10\x00\x02\x00\x00\x00",
+    );
+    refresh_image_crc(&mut image);
+    image
+}
+
+fn refresh_image_crc(image: &mut [u8]) {
+    let offset = CANDIDATE_MANIFEST_OFFSET + 40;
+    let crc = bootloader_image_crc32(image, offset);
+    wr_u32(image, offset, crc);
+}
+
+#[test]
+fn combined_tower_preserves_sd_identity_and_signed_package_contract() {
+    let image = tower_combined_image();
+    let board = BootloaderBoard::HeltecMeshTowerV2;
+    let identity = validate_bootloader_image_for_profile(&image, board, STORAGE_SD_UPDATE).unwrap();
+    assert_eq!(identity.storage_flags, STORAGE_SD_UPDATE);
+    assert!(validate_bootloader_image_for_profile(&image, board, STORAGE_INTERNAL_UPDATE).is_err());
+    let built = build_bootloader(&BootloaderBuildOpts {
+        image,
+        board,
+        storage_profile: STORAGE_SD_UPDATE,
+        sign_seed: TEST_SEED,
+    })
+    .unwrap();
+    assert!(verify(&built.bytes).is_empty());
+    assert_eq!(built.bytes.len(), PACKAGE_SIZE);
+    assert_eq!(
+        Manifest::parse(&built.bytes).unwrap().target_id,
+        board.target_id()
+    );
+}
+
+#[test]
+fn combined_tower_rejects_bad_optional_records_and_ram_contract() {
+    let board = BootloaderBoard::HeltecMeshTowerV2;
+    for offset in [0x90, 0x98, 0x9A, 0x9C, 0xA8, 0xAA, 0xAC, 0xAD] {
+        let mut image = tower_combined_image();
+        image[offset] ^= 1;
+        refresh_image_crc(&mut image);
+        assert!(
+            validate_bootloader_image_for_profile(&image, board, STORAGE_SD_UPDATE).is_err(),
+            "offset {offset:x}"
+        );
+    }
+    for duplicate_ram_only in [false, true] {
+        let mut image = tower_combined_image();
+        let size = if duplicate_ram_only { 16 } else { 32 };
+        image.copy_within(0x90..0x90 + size, 0x100);
+        refresh_image_crc(&mut image);
+        assert!(validate_bootloader_image_for_profile(&image, board, STORAGE_SD_UPDATE).is_err());
+    }
+    let mut image = tower_combined_image();
+    wr_u32(&mut image, 0, 0x2004_0000);
+    refresh_image_crc(&mut image);
+    assert!(validate_bootloader_image_for_profile(&image, board, STORAGE_SD_UPDATE).is_err());
+}
+
+#[test]
+fn optional_storage_cannot_cross_board_or_primary_profile() {
+    for (board, primary, optional) in [
+        (BootloaderBoard::HeltecMeshTowerV2, STORAGE_SD_UPDATE, 0x14),
+        (
+            BootloaderBoard::HeltecMeshTowerV2,
+            STORAGE_INTERNAL_UPDATE,
+            0x02,
+        ),
+        (
+            BootloaderBoard::WiscoreRak3401,
+            STORAGE_INTERNAL_UPDATE,
+            0x02,
+        ),
+        (BootloaderBoard::Gat562, STORAGE_INTERNAL_UPDATE, 0x02),
+    ] {
+        let mut image = synthetic_image(board, primary);
+        wr_u32(&mut image, 0, 0x2003_0000);
+        image[0x90..0xB0].copy_from_slice(&tower_combined_image()[0x90..0xB0]);
+        image[0xAC] = optional;
+        refresh_image_crc(&mut image);
+        assert!(validate_bootloader_image_for_profile(&image, board, primary).is_err());
+    }
+}
+
 #[test]
 fn qualified_inventory_builds_exact_v3_packages() {
     validate_bootloader_inventory().unwrap();

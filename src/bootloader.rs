@@ -545,15 +545,20 @@ pub fn validate_bootloader_image(
         "bootloader update/recovery storage profile 0x{storage:02X} is not valid for its identity"
     );
     let optional_storage = optional_application_storage(image)?;
-    if optional_storage {
+    if optional_storage != 0 {
         ensure!(
-            storage == STORAGE_INTERNAL_UPDATE
+            (optional_storage == 0x14
+                && storage == STORAGE_INTERNAL_UPDATE
                 && embedded.board_id == 0x239A_0029
-                && matches!(embedded.device_name.as_str(), "3401_DFU" | "4631_DFU"),
-            "optional RAK application storage requires the deployed board identity"
+                && matches!(embedded.device_name.as_str(), "3401_DFU" | "4631_DFU"))
+                || (optional_storage == 0x02
+                    && storage == STORAGE_SD_UPDATE
+                    && embedded.board_id == 0x239A_0071
+                    && embedded.device_name == "TOWER_V2_OTA"),
+            "optional application storage does not match the qualified primary board profile"
         );
     }
-    if storage == STORAGE_RAK_AUTO_UPDATE || optional_storage {
+    if storage == STORAGE_RAK_AUTO_UPDATE || optional_storage != 0 {
         const RAM_CAPS: &[u8; 16] = b"MOTARAMA\x01\x00\x48\x00\x00\x00\x01\x00";
         let markers = image
             .chunks_exact(4)
@@ -622,7 +627,7 @@ pub fn validate_bootloader_image_for_profile(
         BootloaderBoard::WiscoreRak3401Auto | BootloaderBoard::WiscoreRak4631Auto
     ) {
         ensure!(
-            optional_application_storage(image)?,
+            optional_application_storage(image)? == 0x14,
             "unified RAK image lacks optional application storage capability"
         );
     }
@@ -762,21 +767,30 @@ fn parse_identity(image: &[u8]) -> Result<BootloaderIdentity> {
     })
 }
 
-fn optional_application_storage(image: &[u8]) -> Result<bool> {
-    const RECORD: &[u8; 32] =
+fn optional_application_storage(image: &[u8]) -> Result<u8> {
+    const RAK_RECORD: &[u8; 32] =
         b"MOTARAMA\x01\x00\x48\x00\x00\x00\x01\x00MOTASTOR\x01\x00\x10\x00\x14\x00\x00\x00";
+    const TOWER_RECORD: &[u8; 32] =
+        b"MOTARAMA\x01\x00\x48\x00\x00\x00\x01\x00MOTASTOR\x01\x00\x10\x00\x02\x00\x00\x00";
     let mut count = 0;
+    let mut storage = 0;
     for off in (0..image.len().saturating_sub(7)).step_by(4) {
         if image.get(off..off + 8) != Some(b"MOTASTOR".as_slice()) {
             continue;
         }
         count += 1;
+        let record = off
+            .checked_sub(16)
+            .and_then(|start| image.get(start..off + 16));
         ensure!(
-            count == 1 && off >= 16 && image.get(off - 16..off + 16) == Some(RECORD.as_slice()),
-            "optional RAK application storage marker is invalid or ambiguous"
+            count == 1
+                && (record == Some(RAK_RECORD.as_slice())
+                    || record == Some(TOWER_RECORD.as_slice())),
+            "optional application storage marker is invalid or ambiguous"
         );
+        storage = image[off + 12];
     }
-    Ok(count == 1)
+    Ok(storage)
 }
 
 fn capability_storage(image: &[u8]) -> Option<u8> {
