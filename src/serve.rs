@@ -382,11 +382,18 @@ enum PumpEvent {
 
 fn read_byte(link: &mut dyn Link) -> Byte {
     let mut b = [0u8; 1];
-    match link.read(&mut b) {
-        Ok(1) => Byte::Got(b[0]),
-        Ok(_) => Byte::Closed, // 0 = EOF/peer closed
-        Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => Byte::Timeout,
-        Err(_) => Byte::Closed,
+    loop {
+        match link.read(&mut b) {
+            Ok(1) => return Byte::Got(b[0]),
+            Ok(_) => return Byte::Closed, // 0 = EOF/peer closed
+            // A signal can interrupt a timed TCP read without closing its socket. Retry the same
+            // byte so an interruption within a binary frame does not discard its earlier bytes.
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
+                return Byte::Timeout;
+            }
+            Err(_) => return Byte::Closed,
+        }
     }
 }
 
@@ -743,6 +750,7 @@ mod tests {
 
     enum ReadStep {
         Byte(u8),
+        Interrupted,
         Timeout(Duration),
         Closed,
     }
@@ -770,6 +778,10 @@ mod tests {
                     buf[0] = b;
                     Ok(1)
                 }
+                ReadStep::Interrupted => Err(io::Error::new(
+                    ErrorKind::Interrupted,
+                    "scripted interruption",
+                )),
                 ReadStep::Timeout(delay) => {
                     thread::sleep(delay);
                     Err(io::Error::new(ErrorKind::TimedOut, "scripted timeout"))
@@ -822,6 +834,68 @@ mod tests {
             .windows(needle.len())
             .filter(|w| *w == needle)
             .count()
+    }
+
+    #[test]
+    fn byte_read_retries_interrupted_calls_without_closing_the_link() {
+        let mut link = ScriptedLink::new([
+            ReadStep::Interrupted,
+            ReadStep::Interrupted,
+            ReadStep::Byte(b'M'),
+        ]);
+
+        assert!(matches!(read_byte(&mut link), Byte::Got(b'M')));
+        assert!(matches!(read_byte(&mut link), Byte::Closed));
+    }
+
+    #[test]
+    fn interrupted_reads_preserve_later_timeout_and_eof_semantics() {
+        let mut timeout =
+            ScriptedLink::new([ReadStep::Interrupted, ReadStep::Timeout(Duration::ZERO)]);
+        assert!(matches!(read_byte(&mut timeout), Byte::Timeout));
+
+        let mut closed = ScriptedLink::new([ReadStep::Interrupted, ReadStep::Closed]);
+        assert!(matches!(read_byte(&mut closed), Byte::Closed));
+    }
+
+    #[test]
+    fn interruptions_at_every_frame_boundary_preserve_complete_requests() {
+        // COUNT has no arguments; STAT exercises arguments containing the magic bytes themselves.
+        for (op, args, status, payload) in [
+            (seeder::OP_COUNT, vec![], seeder::STATUS_OK, vec![0]),
+            (
+                seeder::OP_STAT,
+                vec![b'M', b'S', 1, 2],
+                seeder::STATUS_ERR,
+                vec![],
+            ),
+        ] {
+            let mut request = seeder::REQ_MAGIC.to_vec();
+            request.push(op);
+            request.extend_from_slice(&args);
+            request.push(xor(&args, op));
+            let mut response = seeder::RSP_MAGIC.to_vec();
+            response.extend([op, status]);
+            response.extend(payload);
+            response.push(xor(&response, 0));
+
+            for gap in 0..=request.len() {
+                let mut reads = byte_steps(&request[..gap]);
+                reads.extend([ReadStep::Interrupted, ReadStep::Interrupted]);
+                reads.extend(byte_steps(&request[gap..]));
+                let mut link = ScriptedLink::new(reads);
+
+                serve_loop(
+                    &mut link,
+                    &test_core(),
+                    false,
+                    |_| {},
+                    &AtomicBool::new(false),
+                );
+
+                assert_eq!(link.writes, response, "op={op}, interrupted boundary={gap}");
+            }
+        }
     }
 
     #[test]
