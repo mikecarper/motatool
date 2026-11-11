@@ -61,6 +61,8 @@ enum CliBootloaderBoard {
     PromicroNrf52840,
     #[value(name = "t1000_e")]
     T1000E,
+    #[value(name = "meshtracker_x1")]
+    MeshTrackerX1,
     #[value(name = "thinknode_m3")]
     ThinknodeM3,
     #[value(name = "wiscore_rak3401")]
@@ -112,6 +114,7 @@ impl CliBootloaderBoard {
             Self::MinewsemiMx25le01 => BootloaderBoard::MinewsemiMx25le01,
             Self::PromicroNrf52840 => BootloaderBoard::PromicroNrf52840,
             Self::T1000E => BootloaderBoard::T1000E,
+            Self::MeshTrackerX1 => BootloaderBoard::MeshTrackerX1,
             Self::ThinknodeM3 => BootloaderBoard::ThinknodeM3,
             Self::WiscoreRak3401 => BootloaderBoard::WiscoreRak3401,
             Self::WiscoreRak4631Board => BootloaderBoard::WiscoreRak4631Board,

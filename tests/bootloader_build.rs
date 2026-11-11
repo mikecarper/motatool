@@ -3,8 +3,8 @@ use motatool::bootloader::{
     extract_bootloader_region_from_hex, validate_bootloader_image_for_profile,
     validate_bootloader_inventory, BootloaderBoard, BootloaderBuildOpts, BOOTLOADER_BOARDS,
     CANDIDATE_MANIFEST_OFFSET, CAPS_MAGIC, CONTINUITY_MAGIC, IMAGE_SIZE, IMAGE_START,
-    MANIFEST_MAGIC, PACKAGE_SIZE, STORAGE_INTERNAL_UPDATE, STORAGE_RAK_AUTO_RECOVERY,
-    STORAGE_RAK_AUTO_UPDATE, STORAGE_SD_UPDATE,
+    MANIFEST_MAGIC, PACKAGE_SIZE, STORAGE_INTERNAL_UPDATE, STORAGE_QSPI_UPDATE,
+    STORAGE_RAK_AUTO_RECOVERY, STORAGE_RAK_AUTO_UPDATE, STORAGE_SD_UPDATE,
 };
 use motatool::crypto::ed25519_public_from_seed;
 use motatool::format::{wr_u32, BOOT_FORMAT_VER, MFLAG_BOOTLOADER, MFLAG_FULL, MFLAG_SIGNED};
@@ -27,12 +27,14 @@ fn synthetic_image(board: BootloaderBoard, storage: u8) -> Vec<u8> {
     if storage == STORAGE_RAK_AUTO_UPDATE
         || matches!(
             board,
-            BootloaderBoard::WiscoreRak3401Auto | BootloaderBoard::WiscoreRak4631Auto
+            BootloaderBoard::WiscoreRak3401Auto
+                | BootloaderBoard::WiscoreRak4631Auto
+                | BootloaderBoard::MeshTrackerX1
         )
     {
         wr_u32(&mut image, 0, 0x2003_0000);
         image[0x90..0xA0].copy_from_slice(b"MOTARAMA\x01\x00\x48\x00\x00\x00\x01\x00");
-        if storage == STORAGE_INTERNAL_UPDATE {
+        if storage == STORAGE_INTERNAL_UPDATE && board != BootloaderBoard::MeshTrackerX1 {
             image[0xA0..0xB0].copy_from_slice(b"MOTASTOR\x01\x00\x10\x00\x14\x00\x00\x00");
         }
     }
@@ -222,6 +224,87 @@ fn selected_board_and_storage_profile_are_enforced() {
     .is_err());
 }
 
+fn assert_x1_image_rejected(image: Vec<u8>, case: &str) {
+    assert!(
+        build_bootloader(&BootloaderBuildOpts {
+            image,
+            board: BootloaderBoard::MeshTrackerX1,
+            storage_profile: STORAGE_INTERNAL_UPDATE,
+            sign_seed: TEST_SEED,
+        })
+        .is_err(),
+        "accepted invalid X1 image: {case}"
+    );
+}
+
+#[test]
+fn meshtracker_x1_rejects_other_identities_platforms_and_storage() {
+    let board = BootloaderBoard::MeshTrackerX1;
+    assert_eq!(board.board_id(), BootloaderBoard::T1000E.board_id());
+    assert_ne!(board.target_id(), BootloaderBoard::T1000E.target_id());
+    assert_eq!(
+        BootloaderBoard::from_identity(0x2886_0057, "X1INT_DFU"),
+        Some(board)
+    );
+    for foreign in [BootloaderBoard::T1000E, BootloaderBoard::SensecapSolarP1] {
+        assert_x1_image_rejected(
+            synthetic_image(foreign, foreign.storage_profile()),
+            foreign.name(),
+        );
+    }
+    for name in ["T1KE_DFU", "SCAP_DFU", "X1_DFU"] {
+        let mut image = synthetic_image(board, STORAGE_INTERNAL_UPDATE);
+        let offset = CANDIDATE_MANIFEST_OFFSET + 24;
+        image[offset..offset + 16].fill(0);
+        image[offset..offset + name.len()].copy_from_slice(name.as_bytes());
+        refresh_image_crc(&mut image);
+        assert_x1_image_rejected(image, name);
+    }
+    for (family, fwid, app_base, abi) in [
+        (132, 0x0123, 0x27000, 1),
+        (140, 0x00B6, 0x27000, 1),
+        (140, 0x0123, 0x26000, 1),
+        (140, 0x0123, 0x27000, 2),
+    ] {
+        let mut image = synthetic_image(board, STORAGE_INTERNAL_UPDATE);
+        let offset = CANDIDATE_MANIFEST_OFFSET + 44;
+        wr_u16(&mut image, offset + 16, family);
+        wr_u16(&mut image, offset + 18, fwid);
+        wr_u32(&mut image, offset + 20, app_base);
+        wr_u16(&mut image, offset + 24, abi);
+        refresh_image_crc(&mut image);
+        assert_x1_image_rejected(image, "continuity platform");
+    }
+    for storage in [STORAGE_SD_UPDATE, STORAGE_QSPI_UPDATE] {
+        assert_x1_image_rejected(synthetic_image(board, storage), "external staging");
+    }
+    for length in [IMAGE_SIZE - 1, IMAGE_SIZE + 1] {
+        let mut image = synthetic_image(board, STORAGE_INTERNAL_UPDATE);
+        image.resize(length, 0xFF);
+        assert_x1_image_rejected(image, "non-exact image length");
+    }
+}
+
+#[test]
+fn meshtracker_x1_requires_its_unique_fixed_ram_arena() {
+    let board = BootloaderBoard::MeshTrackerX1;
+    for offset in 0x90..0xA0 {
+        let mut image = synthetic_image(board, STORAGE_INTERNAL_UPDATE);
+        image[offset] ^= 1;
+        refresh_image_crc(&mut image);
+        assert_x1_image_rejected(image, &format!("RAM marker byte {offset:x}"));
+    }
+    let mut image = synthetic_image(board, STORAGE_INTERNAL_UPDATE);
+    image.copy_within(0x90..0xA0, 0x100);
+    refresh_image_crc(&mut image);
+    assert_x1_image_rejected(image, "duplicate RAM marker");
+
+    let mut image = synthetic_image(board, STORAGE_INTERNAL_UPDATE);
+    wr_u32(&mut image, 0, 0x2003_0008);
+    refresh_image_crc(&mut image);
+    assert_x1_image_rejected(image, "stack enters the retained arena");
+}
+
 #[test]
 fn compatible_rak_preserves_legacy_identity_and_optional_storage() {
     for (current, legacy) in [
@@ -365,6 +448,14 @@ fn qualified_inventory_matches_release_contract() {
             BootloaderBoard::T1000E,
             0xE6F5_F03F,
             "NRF_BL_28860057_T1KE_DFU",
+            0x0123,
+            0x0002_7000,
+            0x0A,
+        ),
+        (
+            BootloaderBoard::MeshTrackerX1,
+            0xCDDA_9FF9,
+            "NRF_BL_28860057_X1INT_DFU",
             0x0123,
             0x0002_7000,
             0x0A,
@@ -611,6 +702,64 @@ fn cli_build_bootloader_matches_release_interface() {
     assert!(verify(&blob).is_empty());
     let manifest = Manifest::parse(&blob).unwrap();
     assert_eq!(manifest.signer, ed25519_public_from_seed(&TEST_SEED));
+}
+
+#[test]
+fn cli_meshtracker_x1_builds_a_signed_package_and_requires_a_key() {
+    let board = BootloaderBoard::MeshTrackerX1;
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("meshtracker_x1_bootloader.hex");
+    let key = dir.path().join("signing.key");
+    let output_dir = dir.path().join("packages");
+    std::fs::write(
+        &input,
+        image_as_intel_hex(&synthetic_image(board, STORAGE_INTERNAL_UPDATE)),
+    )
+    .unwrap();
+    std::fs::write(&key, hex::encode_upper(TEST_SEED)).unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_motatool"))
+        .args(["build-bootloader", "--fw"])
+        .arg(&input)
+        .args(["--board", "meshtracker_x1", "--sign"])
+        .arg(&key)
+        .arg("--out-dir")
+        .arg(&output_dir)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stdout = String::from_utf8(result.stdout).unwrap();
+    assert!(stdout.contains("board=meshtracker_x1"), "{stdout}");
+    assert!(stdout.contains("target=CDDA9FF9"), "{stdout}");
+    let packages: Vec<_> = std::fs::read_dir(&output_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(packages.len(), 1);
+    let blob = std::fs::read(&packages[0]).unwrap();
+    assert_eq!(blob.len(), PACKAGE_SIZE);
+    assert!(verify(&blob).is_empty());
+    let manifest = Manifest::parse(&blob).unwrap();
+    assert_eq!(manifest.target_id, 0xCDDA_9FF9);
+    assert_eq!(manifest.hw_id, board.hw_id());
+    assert_eq!(manifest.signer, ed25519_public_from_seed(&TEST_SEED));
+    assert_eq!(manifest.flags, MFLAG_FULL | MFLAG_SIGNED | MFLAG_BOOTLOADER);
+
+    let unsigned_dir = dir.path().join("unsigned");
+    let result = Command::new(env!("CARGO_BIN_EXE_motatool"))
+        .args(["build-bootloader", "--fw"])
+        .arg(&input)
+        .args(["--board", "meshtracker_x1", "--out-dir"])
+        .arg(&unsigned_dir)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("--sign"));
+    assert!(!unsigned_dir.exists());
 }
 
 #[test]

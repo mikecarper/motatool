@@ -105,7 +105,8 @@ Every output has the strict MeshCore bootloader profile:
   application base, layout ABI, storage profile, signed `target_id`, and signed `hw_id`.
 
 The compatibility tuple is S140 7.3.0 (`family=140`, `FWID=0x0123`, `app_base=0x27000`) for both XIAO
-variants, Minewsemi MX25LE01, and T1000-E. Every other current profile uses S140 6.1.1 (`family=140`,
+variants, Minewsemi MX25LE01, T1000-E, MeshTracker X1, SenseCAP Solar P1, and Wio Tracker L1.
+Every other current profile uses S140 6.1.1 (`family=140`,
 `FWID=0x00B6`, `app_base=0x26000`). All current profiles require layout ABI 1. The exact selectors and signed
 routing identities are:
 
@@ -124,12 +125,17 @@ routing identities are:
 | `minewsemi_mx25le01` | `0x239A0029` | `0x026AA982` | `NRF_BL_239A0029_MX25_DFU` / `MX25_DFU` | `0x0A` internal |
 | `promicro_nrf52840` | `0x239A00B3` | `0xAF79E8CC` | `NRF_BL_239A00B3_PROM_DFU` / `PROM_DFU` | `0x0A` internal |
 | `t1000_e` | `0x28860057` | `0xE6F5F03F` | `NRF_BL_28860057_T1KE_DFU` / `T1KE_DFU` | `0x0A` internal |
+| `meshtracker_x1` | `0x28860057` | `0xCDDA9FF9` | `NRF_BL_28860057_X1INT_DFU` / `X1INT_DFU` | `0x0A` internal + 64 KiB RAM arena |
 | `thinknode_m3` | `0x239A00DA` | `0x0CA41DB2` | `NRF_BL_239A00DA_TNM3_DFU` / `TNM3_DFU` | `0x0A` internal |
 | `wiscore_rak3401` | `0x239A0029` | `0x23818A80` | `NRF_BL_239A0029_3401_DFU` / `3401_DFU` | `0x0A` internal |
 | `wiscore_rak4631_board` | `0x239A0029` | `0x2D0DF000` | `NRF_BL_239A0029_4631_DFU` / `4631_DFU` | `0x0A` internal |
 | `wiscore_rak3401_auto` | `0x239A0029` | `0xD04AB3AB` | `NRF_BL_239A0029_3401_AUTO_DFU` / `3401_AUTO_DFU` | `0x16` application recovery |
 | `wiscore_rak4631_auto` | `0x239A0029` | `0xFEEAFD1B` | `NRF_BL_239A0029_4631_AUTO_DFU` / `4631_AUTO_DFU` | `0x16` application recovery |
 | `wismesh_tag` | `0x239A0029` | `0xC72E9C9C` | `NRF_BL_239A0029_RTAG_DFU` / `RTAG_DFU` | `0x0A` internal |
+
+MeshTracker X1 images must retain the fixed 64 KiB `MOTARAMA` arena and keep their initial stack at or below
+`0x20030000`. Its USB-derived board ID is shared with T1000-E; the exact `X1INT_DFU` name keeps their
+packages separate.
 
 Generic `DEVICE_NAME` values are 1 through 15 non-space printable ASCII bytes followed by NUL padding. Their
 canonical hardware ID is `NRF_BL_<BOARDID8>_<DEVICE_NAME>`, NUL-padded to 32 bytes, and their wire target is

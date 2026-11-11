@@ -70,6 +70,7 @@ pub enum BootloaderBoard {
     MinewsemiMx25le01,
     PromicroNrf52840,
     T1000E,
+    MeshTrackerX1,
     ThinknodeM3,
     WiscoreRak3401,
     WiscoreRak4631Board,
@@ -88,7 +89,7 @@ pub enum BootloaderBoard {
     WiscoreRak4631W25q16,
 }
 
-pub const BOOTLOADER_BOARDS: [BootloaderBoard; 28] = [
+pub const BOOTLOADER_BOARDS: [BootloaderBoard; 29] = [
     BootloaderBoard::XiaoNrf52840Ble,
     BootloaderBoard::XiaoNrf52840BleSense,
     BootloaderBoard::Gat562,
@@ -101,6 +102,7 @@ pub const BOOTLOADER_BOARDS: [BootloaderBoard; 28] = [
     BootloaderBoard::MinewsemiMx25le01,
     BootloaderBoard::PromicroNrf52840,
     BootloaderBoard::T1000E,
+    BootloaderBoard::MeshTrackerX1,
     BootloaderBoard::ThinknodeM3,
     BootloaderBoard::WiscoreRak3401,
     BootloaderBoard::WiscoreRak4631Board,
@@ -149,7 +151,7 @@ impl BootloaderBoard {
             | Self::WiscoreRak3401Auto
             | Self::WiscoreRak4631Auto
             | Self::WismeshTag => 0x239A_0029,
-            Self::T1000E => 0x2886_0057,
+            Self::T1000E | Self::MeshTrackerX1 => 0x2886_0057,
             Self::SensecapSolarP1 => 0x2886_0044,
             Self::WioTrackerL1 => 0x2886_1667,
             Self::ThinknodeM3
@@ -174,6 +176,7 @@ impl BootloaderBoard {
             Self::MinewsemiMx25le01 => "minewsemi_mx25le01",
             Self::PromicroNrf52840 => "promicro_nrf52840",
             Self::T1000E => "t1000_e",
+            Self::MeshTrackerX1 => "meshtracker_x1",
             Self::ThinknodeM3 => "thinknode_m3",
             Self::WiscoreRak3401 => "wiscore_rak3401",
             Self::WiscoreRak4631Board => "wiscore_rak4631_board",
@@ -206,6 +209,7 @@ impl BootloaderBoard {
             Self::MinewsemiMx25le01 => "MX25_DFU",
             Self::PromicroNrf52840 => "PROM_DFU",
             Self::T1000E => "T1KE_DFU",
+            Self::MeshTrackerX1 => "X1INT_DFU",
             Self::ThinknodeM3 => "TNM3_DFU",
             Self::WiscoreRak3401 => "3401_DFU",
             Self::WiscoreRak4631Board => "4631_DFU",
@@ -266,6 +270,7 @@ impl BootloaderBoard {
             | Self::XiaoNrf52840BleSense
             | Self::MinewsemiMx25le01
             | Self::T1000E
+            | Self::MeshTrackerX1
             | Self::SensecapSolarP1
             | Self::WioTrackerL1 => BootloaderCompatibility {
                 softdevice_family: FAMILY_S140,
@@ -422,6 +427,7 @@ const INTERNAL_IDENTITIES: &[(u32, &str)] = &[
     (0x239A_0029, "MX25_DFU"),
     (0x239A_00B3, "PROM_DFU"),
     (0x2886_0057, "T1KE_DFU"),
+    (0x2886_0057, "X1INT_DFU"),
     (0x239A_00DA, "TNM3_DFU"),
     (0x239A_0029, "3401_DFU"),
     (0x239A_0029, "4631_DFU"),
@@ -446,6 +452,7 @@ const S140_V7_IDENTITIES: &[(u32, &str)] = &[
     (XIAO_SENSE, "XIAO_DFU"),
     (0x239A_0029, "MX25_DFU"),
     (0x2886_0057, "T1KE_DFU"),
+    (0x2886_0057, "X1INT_DFU"),
     (0x2886_0044, "SCAP_DFU"),
     (0x2886_1667, "WTL1_DFU"),
 ];
@@ -558,7 +565,10 @@ pub fn validate_bootloader_image(
             "optional application storage does not match the qualified primary board profile"
         );
     }
-    if storage == STORAGE_RAK_AUTO_UPDATE || optional_storage != 0 {
+    if storage == STORAGE_RAK_AUTO_UPDATE
+        || optional_storage != 0
+        || (embedded.board_id == 0x2886_0057 && embedded.device_name == "X1INT_DFU")
+    {
         const RAM_CAPS: &[u8; 16] = b"MOTARAMA\x01\x00\x48\x00\x00\x00\x01\x00";
         let markers = image
             .chunks_exact(4)
@@ -570,7 +580,7 @@ pub fn validate_bootloader_image(
             .count();
         ensure!(
             markers == 1 && rd_u32(image, 0) <= 0x2003_0000,
-            "adaptive bootloader must retain its 64 KiB hybrid RAM arena"
+            "bootloader must retain its qualified 64 KiB hybrid RAM arena"
         );
     }
 
