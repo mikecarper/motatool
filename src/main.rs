@@ -56,6 +56,8 @@ enum CliBootloaderBoard {
     HeltecT114,
     #[value(name = "keepteen_lt1")]
     KeepteenLt1,
+    #[value(name = "meshtracker_x1")]
+    MeshtrackerX1,
     #[value(name = "minewsemi_mx25le01")]
     MinewsemiMx25le01,
     #[value(name = "promicro_nrf52840")]
@@ -110,6 +112,7 @@ impl CliBootloaderBoard {
             Self::HeltecT1 => BootloaderBoard::HeltecT1,
             Self::HeltecT114 => BootloaderBoard::HeltecT114,
             Self::KeepteenLt1 => BootloaderBoard::KeepteenLt1,
+            Self::MeshtrackerX1 => BootloaderBoard::MeshtrackerX1,
             Self::MinewsemiMx25le01 => BootloaderBoard::MinewsemiMx25le01,
             Self::PromicroNrf52840 => BootloaderBoard::PromicroNrf52840,
             Self::T1000E => BootloaderBoard::T1000E,
@@ -288,6 +291,9 @@ struct ServeArgs {
     /// Serve only the top folder; don't descend into sub-folders.
     #[arg(long = "no-recursive")]
     no_recursive: bool,
+    /// Send uncompressed transport blocks without precomputing DEFLATE.
+    #[arg(long)]
+    raw_blocks: bool,
     /// (serial only) don't auto-send `ota folder on`/`off` on the node's console.
     #[arg(long = "no-enable")]
     no_enable: bool,
@@ -744,7 +750,7 @@ fn cmd_serve(a: ServeArgs) -> Result<()> {
     }
     if folder.count() == 0 {
         eprintln!("  (nothing valid to serve)");
-    } else {
+    } else if !a.raw_blocks {
         eprintln!("preparing raw-DEFLATE transport with Zopfli --i1000 before opening the link");
         folder.prepare_deflate_cache(|done, total| {
             eprintln!("  compressed {done}/{total} blocks");
@@ -753,6 +759,7 @@ fn cmd_serve(a: ServeArgs) -> Result<()> {
 
     // The same folder doubles as the pull-to-folder capture store.
     let mut core = SeederCore::new(folder, Some(dir));
+    core.set_deflate_enabled(!a.raw_blocks);
     if let Some(seed_path) = &a.seed {
         let bytes =
             std::fs::read(seed_path).with_context(|| format!("cannot read seed {seed_path}"))?;

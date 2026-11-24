@@ -147,6 +147,7 @@ pub struct SeederCore {
     folder: Folder,
     store_dir: Option<PathBuf>,
     seed: Option<(Vec<u8>, u32)>, // (payload, block_count) injected into a fresh capture on OP_BEGIN
+    deflate_enabled: bool,
 }
 
 impl SeederCore {
@@ -155,7 +156,12 @@ impl SeederCore {
             folder,
             store_dir,
             seed: None,
+            deflate_enabled: true,
         }
+    }
+
+    pub fn set_deflate_enabled(&mut self, enabled: bool) {
+        self.deflate_enabled = enabled;
     }
 
     /// Stage a *similar* build's payload into each captured `.part` so `ota pull … validate` on the node
@@ -175,7 +181,7 @@ impl SeederCore {
         match op {
             OP_COUNT => Some((STATUS_OK, vec![self.folder.count().min(255) as u8])),
             OP_DESCRIBE => Some(match self.folder.at(*args.first()? as usize) {
-                Some(s) => (STATUS_OK, describe(s).to_vec()),
+                Some(s) => (STATUS_OK, describe(s, self.deflate_enabled).to_vec()),
                 None => (STATUS_ERR, vec![]),
             }),
             OP_READ => {
@@ -188,7 +194,8 @@ impl SeederCore {
                     _ => (STATUS_ERR, vec![]),
                 })
             }
-            OP_DEFLATE_BLOCK => Some(self.deflate_block(args)),
+            OP_DEFLATE_BLOCK if self.deflate_enabled => Some(self.deflate_block(args)),
+            OP_DEFLATE_BLOCK => Some((STATUS_ERR, vec![])),
             OP_STAT | OP_BEGIN | OP_WRITE | OP_SREAD | OP_FIN => {
                 Some(self.handle_storage(op, args))
             }
@@ -319,7 +326,7 @@ impl SeederCore {
 
 /// MotaDesc wire (38 B): mid[4] target(4) fwver(4) codec(1) flags(1) total(4) leaves_off(4) block_count(4)
 /// payload_off(4) payload_size(4) block_size_log2(1) source_caps(1) reserved(2).
-fn describe(s: &ServedMota) -> [u8; seeder::DESC_WIRE] {
+fn describe(s: &ServedMota, deflate_enabled: bool) -> [u8; seeder::DESC_WIRE] {
     let m = &s.manifest;
     let mut w = [0u8; seeder::DESC_WIRE];
     w[0..4].copy_from_slice(&m.merkle_root); // mid
@@ -333,7 +340,9 @@ fn describe(s: &ServedMota) -> [u8; seeder::DESC_WIRE] {
     w[26..30].copy_from_slice(&(m.payload_off() as u32).to_le_bytes());
     w[30..34].copy_from_slice(&m.payload_size.to_le_bytes());
     w[34] = m.block_size_log2;
-    w[35] = seeder::SOURCE_CAP_DEFLATE_BLOCK;
+    if deflate_enabled {
+        w[35] = seeder::SOURCE_CAP_DEFLATE_BLOCK;
+    }
     w
 }
 

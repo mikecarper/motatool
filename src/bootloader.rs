@@ -66,6 +66,7 @@ pub enum BootloaderBoard {
     HeltecT1,
     HeltecT114,
     KeepteenLt1,
+    MeshtrackerX1,
     MinewsemiMx25le01,
     PromicroNrf52840,
     T1000E,
@@ -87,7 +88,7 @@ pub enum BootloaderBoard {
     WiscoreRak4631W25q16,
 }
 
-pub const BOOTLOADER_BOARDS: [BootloaderBoard; 28] = [
+pub const BOOTLOADER_BOARDS: [BootloaderBoard; 29] = [
     BootloaderBoard::XiaoNrf52840Ble,
     BootloaderBoard::XiaoNrf52840BleSense,
     BootloaderBoard::Gat562,
@@ -97,6 +98,7 @@ pub const BOOTLOADER_BOARDS: [BootloaderBoard; 28] = [
     BootloaderBoard::HeltecT1,
     BootloaderBoard::HeltecT114,
     BootloaderBoard::KeepteenLt1,
+    BootloaderBoard::MeshtrackerX1,
     BootloaderBoard::MinewsemiMx25le01,
     BootloaderBoard::PromicroNrf52840,
     BootloaderBoard::T1000E,
@@ -148,7 +150,7 @@ impl BootloaderBoard {
             | Self::WiscoreRak3401Auto
             | Self::WiscoreRak4631Auto
             | Self::WismeshTag => 0x239A_0029,
-            Self::T1000E => 0x2886_0057,
+            Self::T1000E | Self::MeshtrackerX1 => 0x2886_0057,
             Self::SensecapSolarP1 => 0x2886_0044,
             Self::WioTrackerL1 => 0x2886_1667,
             Self::ThinknodeM3
@@ -170,6 +172,7 @@ impl BootloaderBoard {
             Self::HeltecT1 => "heltec_t1",
             Self::HeltecT114 => "heltec_t114",
             Self::KeepteenLt1 => "keepteen_lt1",
+            Self::MeshtrackerX1 => "meshtracker_x1",
             Self::MinewsemiMx25le01 => "minewsemi_mx25le01",
             Self::PromicroNrf52840 => "promicro_nrf52840",
             Self::T1000E => "t1000_e",
@@ -202,6 +205,7 @@ impl BootloaderBoard {
             Self::HeltecT1 => "T1_DFU",
             Self::HeltecT114 => "T114_DFU",
             Self::KeepteenLt1 => "KeepteenLT1_OTA",
+            Self::MeshtrackerX1 => "X1INT_DFU",
             Self::MinewsemiMx25le01 => "MX25_DFU",
             Self::PromicroNrf52840 => "PROM_DFU",
             Self::T1000E => "T1KE_DFU",
@@ -265,6 +269,7 @@ impl BootloaderBoard {
             Self::XiaoNrf52840Ble
             | Self::XiaoNrf52840BleSense
             | Self::MinewsemiMx25le01
+            | Self::MeshtrackerX1
             | Self::T1000E
             | Self::SensecapSolarP1
             | Self::WioTrackerL1 => BootloaderCompatibility {
@@ -390,6 +395,7 @@ const INTERNAL_IDENTITIES: &[(u32, &str)] = &[
     (0x239A_0071, "T114_DFU"),
     (0x239A_0071, "MESH_POCKET_OTA"),
     (0x239A_00B3, "KeepteenLT1_OTA"),
+    (0x2886_0057, "X1INT_DFU"),
     (0x239A_0029, "MX25_DFU"),
     (0x239A_00B3, "PROM_DFU"),
     (0x2886_0057, "T1KE_DFU"),
@@ -416,6 +422,7 @@ const S140_V7_IDENTITIES: &[(u32, &str)] = &[
     (XIAO_BASE, "XIAO_DFU"),
     (XIAO_SENSE, "XIAO_DFU"),
     (0x239A_0029, "MX25_DFU"),
+    (0x2886_0057, "X1INT_DFU"),
     (0x2886_0057, "T1KE_DFU"),
     (0x2886_0044, "SCAP_DFU"),
     (0x2886_1667, "WTL1_DFU"),

@@ -172,6 +172,8 @@ slow transfer. Other flags: `--baud` (serial speed), `--no-recursive` (don't des
 `--no-enable` (don't auto-send `ota folder on`/`off` on the serial console), `-v` (log each request).
 The legacy `--companion-terminal` option remains as a deprecated no-op for OTAFIX helper compatibility;
 serial attachment now enters folder mode directly from either Companion USB startup mode.
+Use `--raw-blocks` to skip transport compression and start serving immediately on a slow host.
+It leaves package hashes and signatures unchanged but may use more LoRa airtime.
 
 Newer nodes can also request a logical 2 KiB payload block as an independent raw RFC 1951 DEFLATE stream.
 The host does the compression, so the embedded seeder carries no encoder; blocks which do not shrink

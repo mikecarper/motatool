@@ -42,7 +42,7 @@ fn serve_ops_count_describe_read() {
     let folder = Folder::scan(dir.path(), true, |_, _| {
         panic!("valid mota must not be skipped")
     });
-    let core = SeederCore::new(folder, None);
+    let mut core = SeederCore::new(folder, None);
 
     assert_eq!(core.handle(OP_COUNT, &[]), Some((STATUS_OK, vec![1])));
 
@@ -59,6 +59,16 @@ fn serve_ops_count_describe_read() {
     let mut read_args = vec![0u8]; // idx 0
     read_args.extend_from_slice(&0u32.to_le_bytes());
     read_args.extend_from_slice(&4u16.to_le_bytes());
+    assert_eq!(
+        core.handle(OP_READ, &read_args),
+        Some((STATUS_OK, MAGIC.to_vec()))
+    );
+    core.set_deflate_enabled(false);
+    assert_eq!(core.handle(OP_DESCRIBE, &[0]).unwrap().1[35], 0);
+    assert_eq!(
+        core.handle(OP_DEFLATE_BLOCK, &[0; 7]),
+        Some((STATUS_ERR, vec![]))
+    );
     assert_eq!(
         core.handle(OP_READ, &read_args),
         Some((STATUS_OK, MAGIC.to_vec()))

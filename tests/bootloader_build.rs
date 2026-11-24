@@ -204,6 +204,14 @@ fn qualified_inventory_matches_release_contract() {
             0x0A,
         ),
         (
+            BootloaderBoard::MeshtrackerX1,
+            0xCDDA_9FF9,
+            "NRF_BL_28860057_X1INT_DFU",
+            0x0123,
+            0x0002_7000,
+            0x0A,
+        ),
+        (
             BootloaderBoard::MinewsemiMx25le01,
             0x026A_A982,
             "NRF_BL_239A0029_MX25_DFU",
